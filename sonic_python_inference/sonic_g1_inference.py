@@ -7,15 +7,31 @@ it differs from `SonicSMPLInference` only in `_build_encoder_obs` — the
 proprio layout, history buffers, decoder call, and action scaling are all
 identical (decoder_dyn.onnx is shared).
 
-Encoder obs layout, cross-referenced to training code:
-    joint_pos_multi_future, joint_vel_multi_future  (commands.py:897-903)
-        command_multi_future = cat(joint_pos_future, joint_vel_future) per frame.
-    motion_anchor_ori_b_mf  (observations.py:1022-1043, commands.py:1942-1963)
+Encoder obs layout — EXACTLY matches training code memory layout, which is
+semantically weird but deterministic:
+
+    command_multi_future (commands.py:897-903) =
+        cat([joint_pos_multi_future, joint_vel_multi_future], dim=1)
+    where each child is already flat of shape [N, F*29] with frame-major layout
+    [pos_f0(29), pos_f1(29), ..., pos_fF-1(29)]. So cmd_flat per env =
+        [pos_f0, pos_f1, ..., pos_fF-1, vel_f0, vel_f1, ..., vel_fF-1]  (2*F*29 elems)
+
+    command_multi_future_nonflat (observations.py:584-587) reshapes the flat
+    tensor to [N, F, 2*29=58], which crosses the pos/vel boundary and mixes
+    frames — e.g. slot-0 of the reshape holds [pos_f0(29), pos_f1(29)], and
+    slot-5 of the reshape holds [vel_f0(29), vel_f1(29)]. This is NOT a
+    logical per-frame packing; it's an artefact of the cat(dim=1)+reshape
+    order. But the trained MLP has learned this exact mangled input, so we
+    must reproduce it bit-for-bit.
+
+    motion_anchor_ori_b_mf_nonflat (observations.py:1022-1043, commands.py:1942-1963)
+        flat layout [f0_6d, f1_6d, ..., fF-1_6d] → reshape [N, F, 6]
         6D( quat_mul(quat_inv(robot_anchor_quat_w), ref_root_quat_future) )
-        NOTE: ref_root_quat here is the ROBOT RETARGET root (from robot pkl
-        `root_rot`, xyzw→wxyz), NOT the SMPL root. No Y→Z, no base-rot removal.
-    Per-frame concat: [joint_pos(29) ‖ joint_vel(29) ‖ anchor_ori_6d(6)] = 64
-    Flatten 10 frames → 640D → g1_encoder_dyn.onnx → [N, 64] token
+        ref_root_quat is the ROBOT RETARGET root (from robot pkl `root_rot`,
+        xyzw→wxyz). No Y→Z, no base-rot removal.
+
+    cat([cmd_nonflat(58), anchor_ori_nonflat(6)], dim=-1) → [N, F, 64]
+    reshape(N, -1) → [N, 640] → g1_encoder_dyn.onnx → [N, 64] token
 
 Quaternion convention everywhere: wxyz.
 """
@@ -147,25 +163,35 @@ class SonicG1Inference:
         ref_root_quat_future_wxyz: torch.Tensor,  # [N, 10, 4]
         robot_anchor_quat_wxyz: torch.Tensor,  # [N, 4]
     ) -> np.ndarray:
-        """Pack (N, 10, 64) → (N, 640). Per-frame: [pos(29) ‖ vel(29) ‖ anchor_ori_6d(6)]."""
+        """Pack per training-code layout (see module docstring). Result: [N, 640]."""
         assert joint_pos_future.shape == (self.N, G1_NUM_FUTURE_FRAMES, NUM_JOINTS)
         assert joint_vel_future.shape == (self.N, G1_NUM_FUTURE_FRAMES, NUM_JOINTS)
         assert ref_root_quat_future_wxyz.shape == (self.N, G1_NUM_FUTURE_FRAMES, 4)
         assert robot_anchor_quat_wxyz.shape == (self.N, 4)
 
-        jp = joint_pos_future.to(self.device)
-        jv = joint_vel_future.to(self.device)
+        jp = joint_pos_future.to(self.device)  # [N, F, 29]
+        jv = joint_vel_future.to(self.device)  # [N, F, 29]
         root_ori_6d = _root_ori_b_6d_per_frame(
             robot_anchor_quat_wxyz.to(self.device),
             ref_root_quat_future_wxyz.to(self.device),
-        )  # [N, 10, 6]
+        )  # [N, F, 6]
 
-        # Order MUST match the ONNX encoder, which was exported with input packed
-        # per config.yaml's encoders.g1.inputs order (command_multi_future first,
-        # motion_anchor_ori_b_mf second). command_multi_future itself is
-        # cat(joint_pos, joint_vel) — see commands.py:897-903.
-        per_frame = torch.cat([jp, jv, root_ori_6d], dim=-1)  # [N, 10, 64]
-        flat = per_frame.reshape(self.N, -1)  # [N, 640]
+        # Reproduce commands.py:903 exactly: cat of already-flat tensors.
+        # Each .reshape(N, -1) produces frame-major flat [f0(29), f1(29), ...].
+        jp_flat = jp.reshape(self.N, -1)  # [N, F*29]
+        jv_flat = jv.reshape(self.N, -1)  # [N, F*29]
+        cmd_flat = torch.cat([jp_flat, jv_flat], dim=1)  # [N, 2*F*29]
+
+        # Reproduce observations.py:584-587 non_flatten=True reshape. This is
+        # the mangled per-"slot" reshape (slot i of 58 bytes is NOT [pos_fi, vel_fi]).
+        cmd_nonflat = cmd_flat.reshape(
+            self.N, G1_NUM_FUTURE_FRAMES, -1
+        )  # [N, F, 58]
+
+        # Per config.yaml encoders.g1.inputs: command_multi_future_nonflat first,
+        # motion_anchor_ori_b_mf_nonflat second — concatenated on last dim.
+        slot = torch.cat([cmd_nonflat, root_ori_6d], dim=-1)  # [N, F, 64]
+        flat = slot.reshape(self.N, -1)  # [N, 640]
         assert flat.shape[-1] == G1_ENCODER_INPUT_DIM
         return flat.cpu().numpy().astype(np.float32)
 

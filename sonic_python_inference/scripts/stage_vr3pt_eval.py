@@ -1,4 +1,4 @@
-"""Stage 1: SONIC VR-3PT closed-loop smoke test in Isaac Lab.
+"""VR 3pt closed-loop eval in Isaac Lab.
 
 Mirrors stage_smpl_eval.py's env / obs / reset plumbing; the only intended
 divergence is the motion source. SMPL eval feeds the encoder directly from a
@@ -9,14 +9,15 @@ Obs semantics follow the **training code** (gear_sonic Isaac Lab obs
 functions). Proprioception history, action scale, scene, sim dt/decimation,
 robot reset are identical to stage_smpl_eval.
 
-Default command preset: IDLE stand-still (mode=0, zero movement, target_vel=0).
-VR 3pt is frozen at reset — computed from default-pose wrist / torso world
-poses, normalised into root-local frame (mirror of C++
-GatherVR3PointPosition).
+Default command preset: SLOW_WALK forward at 0.3 m/s. VR 3pt is frozen at
+reset — computed from default-pose wrist / torso world poses, normalised
+into root-local frame (mirror of C++ GatherVR3PointPosition).
+
+Runs indefinitely (until the Isaac Lab window is closed or Ctrl+C).
 
 Usage:
-    uv run --active python -m sonic_python_inference.scripts.stage1_loco_only \
-        --num-envs 4 --episode-sec 10
+    uv run --active python -m sonic_python_inference.scripts.stage_vr3pt_eval \
+        --num-envs 4
 """
 
 from __future__ import annotations
@@ -29,7 +30,6 @@ from pathlib import Path
 def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--num-envs", type=int, default=4)
-    ap.add_argument("--episode-sec", type=float, default=10.0)
     ap.add_argument("--headless", action="store_true")
     ap.add_argument(
         "--encoder-onnx",
@@ -245,10 +245,10 @@ def main():
     target_vel = torch.full((N,), 0.3, dtype=torch.float32, device=device)
     height = torch.full((N,), PLANNER_HEIGHT_DEFAULT, dtype=torch.float32, device=device)
 
-    num_policy_steps = int(args.episode_sec * 50)
     start_root_xy = root_pos_w[:, 0:2].clone()
 
-    for t in range(num_policy_steps):
+    t = 0
+    while simulation_app.is_running():
         joint_pos_il = robot.data.joint_pos.clone()
         joint_vel_il = robot.data.joint_vel.clone()
         root_state = robot.data.root_state_w.clone()
@@ -287,15 +287,7 @@ def main():
                 f"z={z.cpu().tolist()}  fallen={(z < 0.4).cpu().tolist()}"
             )
 
-    final_z = (robot.data.root_pos_w[:, 2] - scene.env_origins[:, 2]).cpu().tolist()
-    travelled = (root_pos_w[:, 0:2] - start_root_xy).norm(dim=-1).cpu().tolist()
-    fallen = [z < 0.4 for z in final_z]
-    print("\n=== Stage 1 summary ===")
-    for i in range(N):
-        print(
-            f"env {i}: travelled={travelled[i]:.2f}m  "
-            f"final_z={final_z[i]:.3f}m  fallen={fallen[i]}"
-        )
+        t += 1
 
     simulation_app.close()
 

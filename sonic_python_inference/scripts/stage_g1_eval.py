@@ -1,4 +1,4 @@
-"""Stage robot eval: closed-loop SONIC G1-mode (teacher) tracking in Isaac Lab.
+"""Stage G1 eval: closed-loop SONIC G1-mode (teacher) tracking in Isaac Lab.
 
 Mirrors `stage_smpl_eval.py` but swaps SMPL encoder → G1 (teacher) encoder.
 Only needs `robot_filtered/*.pkl` — the retargeted robot trajectory drives the
@@ -11,7 +11,7 @@ functions). The g1 encoder sees 10 future frames @ dt=0.1 s (frame_skip=5 at
 TARGET_FPS=50) of [joint_pos(29) ‖ joint_vel(29) ‖ anchor_ori_6d(6)].
 
 Usage:
-    uv run --active python -m sonic_python_inference.scripts.stage_robot_eval \
+    python -m sonic_python_inference.scripts.stage_g1_eval \
         --motion walk_forward_amateur_001__A001 --num-envs 4 --episode-sec 40
 
 Flags:

@@ -1,6 +1,6 @@
 """Stage SMPL eval: closed-loop SONIC SMPL-mode tracking in Isaac Lab.
 
-Mirrors stage1_loco_only.py's sim-driving pattern but swaps
+Mirrors stage_vr3pt_eval.py's sim-driving pattern but swaps
 planner/VR3PT → SonicSMPLInference + SmplMotionLib. Each env is seeded with
 the retargeted robot pose (root pos/quat + 29-DoF joint pos) at frame 0 of a
 chosen SMPL motion, then tracked for the full clip.
