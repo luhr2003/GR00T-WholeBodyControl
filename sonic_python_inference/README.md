@@ -56,21 +56,24 @@ dispatched in parallel via `ThreadPoolExecutor`.
 
 Run everything from the repo root `GR00T-WholeBodyControl/`.
 
-### 1. One-shot install
+### 1. One-shot install (`.venv_isaac`, Python 3.11)
 
-All indices, pins, and workspace members are declared in the root
-`pyproject.toml`. A single `uv sync` populates `.venv_isaac` with Isaac Lab
-(from NVIDIA index), torch cu128, ONNX runtime, and the editable workspace
-packages (`sonic_python_inference`, `gear_sonic`):
+All indices, pins, and the workspace member are declared in the root
+`pyproject.toml`. A single `uv sync` populates `.venv_isaac` (Python 3.11)
+with Isaac Lab 2.3.2 (from NVIDIA index), torch cu128, ONNX runtime, and
+editable `sonic_python_inference` + `gear_sonic`:
 
 ```bash
 uv sync
 ```
 
+This is the env used by all three eval pipelines below. `uv` auto-creates
+`.venv_isaac` if it doesn't exist; subsequent syncs are incremental.
+
 ### 2. Auto-activate with direnv
 
-`.envrc` sets `UV_PROJECT_ENVIRONMENT=.venv_isaac`, activates the venv, and
-sources `gear_sonic_deploy/scripts/setup_env.sh` on `cd` into the repo:
+`.envrc` exports `UV_PROJECT_ENVIRONMENT=.venv_isaac`, activates the venv,
+and sources `gear_sonic_deploy/scripts/setup_env.sh` on `cd` into the repo:
 
 ```bash
 direnv allow
@@ -78,12 +81,28 @@ direnv allow
 
 Without direnv: `source .venv_isaac/bin/activate` manually each shell.
 
-### 3. Isaac Sim EULA
+### 3. (Optional)Separate env for MuJoCo sim side (`.venv_sim`, Python 3.10)
+
+The `gear_sonic[sim]` / `[teleop]` stack (MuJoCo `run_sim_loop.py`, pinocchio
+teleop, pyvista viz) uses a **separate** Python-3.10 venv because pinocchio's
+wheels are 3.10-only. It is NOT managed by the root `uv sync` above. Set it
+up once with:
+
+```bash
+uv venv .venv_sim --python 3.10
+source .venv_sim/bin/activate
+uv pip install -e "gear_sonic[sim,teleop]"
+```
+
+The three SONIC eval pipelines in this README only need `.venv_isaac`. Keep
+`.venv_sim` around only if you also run MuJoCo sim / ZMQ teleop.
+
+### 4. Isaac Sim EULA
 
 The first-ever `isaacsim` / `isaaclab` launch prompts for EULA. Accept it once
 interactively, then subsequent runs are non-interactive.
 
-### 4. Checkpoint + sample data
+### 5. Checkpoint + sample data
 
 Required:
 - `sonic_release/last.pt` + `sonic_release/config.yaml` — the policy checkpoint
@@ -205,12 +224,14 @@ flatten 10 frames                                                   → 840
 
 ```bash
 python -m sonic_python_inference.scripts.stage_smpl_eval \
-    --motion walk_forward_amateur_001__A001 --num-envs 4 --episode-sec 40
+    --motion walk_forward_amateur_001__A001 --num-envs 4
 ```
 
 Needs both `sample_data/smpl_filtered/{motion}.pkl` and
 `sample_data/robot_filtered/.../{motion}.pkl`. Frame 0 of the robot pkl seeds
-the initial pose (root pos/quat + 29-DOF).
+the initial pose (root pos/quat + 29-DOF). Runs for one pass of the motion
+(`max_step - 1` policy ticks), then prints a summary and exits. Ctrl+C or
+close the window to stop early.
 
 ### CLI flags
 
@@ -218,7 +239,6 @@ the initial pose (root pos/quat + 29-DOF).
 |------|---------|---------|
 | `--motion` | `walk_forward_amateur_001__A001` | basename shared between SMPL and robot pkls |
 | `--num-envs` | `4` | parallel envs (all replay the same motion) |
-| `--episode-sec` | `40` | clamped to motion length |
 | `--headless` | off | no viewer |
 | `--smpl-dir` | `sample_data/smpl_filtered` | |
 | `--robot-dir` | `sample_data/robot_filtered` | |
@@ -264,8 +284,11 @@ The reference root quat comes straight from the robot pkl's `root_rot`
 
 ```bash
 python -m sonic_python_inference.scripts.stage_g1_eval \
-    --motion walk_forward_amateur_001__A001 --num-envs 4 --episode-sec 40
+    --motion walk_forward_amateur_001__A001 --num-envs 4
 ```
+
+Runs for one pass of the motion (`max_step - 1` policy ticks), then prints a
+summary and exits. Ctrl+C or close the window to stop early.
 
 ### CLI flags
 
@@ -273,7 +296,6 @@ python -m sonic_python_inference.scripts.stage_g1_eval \
 |------|---------|---------|
 | `--motion` | `walk_forward_amateur_001__A001` | basename under `--robot-dir` |
 | `--num-envs` | `4` | parallel envs |
-| `--episode-sec` | `40` | clamped to motion length |
 | `--headless` | off | no viewer |
 | `--robot-dir` | `sample_data/robot_filtered` | |
 | `--g1-encoder-onnx` | `sonic_python_inference/assets/g1_encoder_dyn.onnx` | |

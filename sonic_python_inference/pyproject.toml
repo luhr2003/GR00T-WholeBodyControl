@@ -37,22 +37,6 @@ dependencies = [
 where = [".."]
 include = ["sonic_python_inference*"]
 
-[tool.uv]
-# `uv sync` / `uv add` pin these indices. `uv pip install -e .` does NOT honor
-# `[tool.uv.sources]`; see README for the explicit `--extra-index-url` invocation.
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
-[[tool.uv.index]]
-name = "nvidia"
-url = "https://pypi.nvidia.com"
-explicit = true
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
-isaaclab = { index = "nvidia" }
-isaacsim = { index = "nvidia" }
+# Indices (pytorch-cu128, nvidia) and `[tool.uv.sources]` for torch / isaaclab
+# live in the root `pyproject.toml` (uv workspace root). Do not duplicate them
+# here — uv sync resolves the whole workspace from the root.

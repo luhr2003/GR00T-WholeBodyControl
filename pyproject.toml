@@ -1,7 +1,71 @@
-# Root pyproject.toml — tooling configuration only.
-# To install packages, use:
-#   pip install -e decoupled_wbc/        (or decoupled_wbc[full], decoupled_wbc[dev])
-#   pip install -e gear_sonic/           (or gear_sonic[teleop], gear_sonic[sim])
+# Root pyproject.toml — uv workspace root for the Isaac Lab / SONIC inference
+# env only. `uv sync` from repo root populates `.venv_isaac` (Python 3.11) with
+# Isaac Lab 2.3.2, torch cu128, ONNX runtime, plus editable
+# `sonic_python_inference` + `gear_sonic`.
+#
+# `.envrc` exports `UV_PROJECT_ENVIRONMENT=.venv_isaac` so uv targets that venv
+# instead of the default `.venv`.
+#
+# gear_sonic is attached as an **editable path dep**, not a workspace member —
+# making it a member would force uv to resolve its `data_collection` extra
+# (which pulls `lerobot @ git+...` and often fails). Members trigger extras
+# resolution at lock time; path sources only pull declared base deps.
+#
+# Separate venvs (NOT managed by this root `uv sync`):
+#   - `.venv_sim` (Python 3.10) — MuJoCo sim + pinocchio teleop, installed
+#     manually via `uv pip install -e "gear_sonic[sim,teleop]"` after creating
+#     the venv with `uv venv .venv_sim --python 3.10`.
+
+[project]
+name = "gr00t-wholebodycontrol"
+version = "0.0.0"
+description = "GR00T whole-body control — SONIC inference workspace root"
+requires-python = "==3.11.*"
+dependencies = [
+    "sonic_python_inference",
+    "gear_sonic",
+]
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+prerelease = "allow"
+# gear_sonic pins numpy==1.26.4, isaacsim pins numpy==1.26.0 — mutually strict.
+# Pin the intersection (==1.26.0) so the workspace resolves. 1.26.0/1.26.4 are
+# ABI-compatible; gear_sonic code doesn't rely on 1.26.4-specific behaviour.
+override-dependencies = [
+    "numpy==1.26.0",
+    # isaacsim-core==5.1.0.0 lists pywin32 without a platform marker. Gate it
+    # to win32 so Linux resolution doesn't try to install Windows-only wheels.
+    "pywin32==306; sys_platform == 'win32'",
+]
+# Tell uv we only install on Linux x86_64 (prevents speculative resolution
+# for Windows / macOS splits).
+required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+isaaclab = { index = "nvidia" }
+isaacsim = { index = "nvidia" }
+sonic_python_inference = { workspace = true }
+gear_sonic = { path = "./gear_sonic", editable = true }
+
+[tool.uv.workspace]
+members = ["sonic_python_inference"]
+
+# ---------------------------------------------------------------------------
+# Tooling (unchanged)
+# ---------------------------------------------------------------------------
 
 [tool.black]
 line-length = 100
@@ -29,7 +93,7 @@ exclude = '''
 profile = "black"
 multi_line_output = 3
 skip = [
-    "external_dependencies", 
+    "external_dependencies",
     "external_dependencies/**",
 ]
 skip_glob = [
@@ -70,7 +134,7 @@ ignore_missing_imports = true
 no_site_packages = true
 check_untyped_defs = true
 exclude = [
-    "external_dependencies", 
+    "external_dependencies",
 ]
 
 [[tool.mypy.overrides]]

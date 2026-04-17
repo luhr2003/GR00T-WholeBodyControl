@@ -8,15 +8,17 @@ chosen SMPL motion, then tracked for the full clip.
 Obs semantics follow the **training code** (gear_sonic Isaac Lab obs
 functions) — not the C++ deploy, which has no SMPL path.
 
+Runs for exactly one pass of the motion (`max_step - 1` policy ticks); prints
+a summary at the end. Ctrl+C or close the viewer to stop early.
+
 Usage:
     uv run --active python -m sonic_python_inference.scripts.stage_smpl_eval \
-        --motion walk_forward_amateur_001__A001 --num-envs 4 --episode-sec 40
+        --motion walk_forward_amateur_001__A001 --num-envs 4
 
 Flags:
     --motion        motion basename shared across envs (paired pkl must exist
                     under both sample_data/smpl_filtered and sample_data/robot_filtered)
     --num-envs      parallel env count
-    --episode-sec   sim duration; clamped to motion length
     --headless      run without viewer
 """
 
@@ -32,7 +34,6 @@ def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--motion", type=str, default="walk_forward_amateur_001__A001")
     ap.add_argument("--num-envs", type=int, default=4)
-    ap.add_argument("--episode-sec", type=float, default=40.0)
     ap.add_argument("--headless", action="store_true")
     ap.add_argument(
         "--smpl-dir", type=str, default="sample_data/smpl_filtered"
@@ -183,12 +184,15 @@ def main():
 
     infer.reset(joint_pos=joint_pos_init)
 
-    # --- Loop --------------------------------------------------------------
-    num_policy_steps = min(int(args.episode_sec * 50), max_step - 1)
+    # --- Loop (one pass of the motion, clamped to max_step - 1) -----------
+    num_policy_steps = max(max_step - 1, 1)
     mpjpe_accum = torch.zeros(args.num_envs, device=device)
     step_counter = 0
 
     for t in range(num_policy_steps):
+        if not simulation_app.is_running():
+            break
+
         joint_pos_il = robot.data.joint_pos.clone()
         joint_vel_il = robot.data.joint_vel.clone()
         root_state = robot.data.root_state_w.clone()
@@ -218,7 +222,6 @@ def main():
             sim.step()
             scene.update(dt=SIM_DT)
 
-        # Tracking error: measured vs reference joint_pos (both IL order, radians)
         mpjpe = (robot.data.joint_pos - fut["dof_pos_ref"]).abs().mean(dim=-1)
         mpjpe_accum += mpjpe
         step_counter += 1

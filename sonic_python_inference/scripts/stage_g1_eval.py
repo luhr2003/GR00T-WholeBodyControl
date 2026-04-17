@@ -10,14 +10,16 @@ Obs semantics follow the **training code** (gear_sonic Isaac Lab obs
 functions). The g1 encoder sees 10 future frames @ dt=0.1 s (frame_skip=5 at
 TARGET_FPS=50) of [joint_pos(29) ‖ joint_vel(29) ‖ anchor_ori_6d(6)].
 
+Runs for exactly one pass of the motion (`max_step - 1` policy ticks); prints
+a summary at the end. Ctrl+C or close the viewer to stop early.
+
 Usage:
     python -m sonic_python_inference.scripts.stage_g1_eval \
-        --motion walk_forward_amateur_001__A001 --num-envs 4 --episode-sec 40
+        --motion walk_forward_amateur_001__A001 --num-envs 4
 
 Flags:
     --motion        motion basename (robot pkl only — no SMPL pkl needed)
     --num-envs      parallel env count
-    --episode-sec   sim duration; clamped to motion length
     --headless      run without viewer
 """
 
@@ -33,7 +35,6 @@ def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--motion", type=str, default="walk_forward_amateur_001__A001")
     ap.add_argument("--num-envs", type=int, default=4)
-    ap.add_argument("--episode-sec", type=float, default=40.0)
     ap.add_argument("--headless", action="store_true")
     ap.add_argument(
         "--robot-dir", type=str, default="sample_data/robot_filtered"
@@ -181,12 +182,15 @@ def main():
 
     infer.reset(joint_pos=joint_pos_init)
 
-    # --- Loop --------------------------------------------------------------
-    num_policy_steps = min(int(args.episode_sec * 50), max_step - 1)
+    # --- Loop (one pass of the motion, clamped to max_step - 1) -----------
+    num_policy_steps = max(max_step - 1, 1)
     mpjpe_accum = torch.zeros(args.num_envs, device=device)
     step_counter = 0
 
     for t in range(num_policy_steps):
+        if not simulation_app.is_running():
+            break
+
         joint_pos_il = robot.data.joint_pos.clone()
         joint_vel_il = robot.data.joint_vel.clone()
         root_state = robot.data.root_state_w.clone()
