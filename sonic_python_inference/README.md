@@ -86,15 +86,23 @@ interactively, then subsequent runs are non-interactive.
 ### 4. Checkpoint + sample data
 
 Required:
-- `sonic_release/last.pt` + `sonic_release/config.yaml`
-- `sample_data/robot_filtered/` — retargeted robot trajectories (G1 + SMPL paths)
-- `sample_data/smpl_filtered/` — SMPL pkls (SMPL path only)
+- `sonic_release/last.pt` + `sonic_release/config.yaml` — the policy checkpoint
+- `sample_data/robot_filtered/` — retargeted robot trajectories (used by SMPL + G1 evals)
+- `sample_data/smpl_filtered/` — SMPL pkls (used by SMPL eval)
 
-Pull with:
+Pull with two separate commands:
 
 ```bash
-python download_from_hf.py --training --no-smpl   # omit --no-smpl if you need SMPL pkls too
+python download_from_hf.py --training --no-smpl   # checkpoint only (~469 MB)
+python download_from_hf.py --sample               # sample_data/ (robot + smpl pkls, small)
 ```
+
+Note on `--no-smpl`: the `--training` flag bundles a ~30 GB `bones_seed_smpl/`
+**training** dataset (extracted to `data/smpl_filtered/`). That's only needed
+if you're re-training the policy. For inference / eval, always pass
+`--no-smpl` — the SMPL eval pipeline reads the small
+`sample_data/smpl_filtered/` pkls that come from `--sample`, not the full
+training bundle.
 
 ---
 
