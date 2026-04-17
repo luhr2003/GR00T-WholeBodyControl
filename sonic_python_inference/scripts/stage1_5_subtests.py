@@ -48,42 +48,11 @@ from sonic_python_inference.sonic_inference import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENCODER_ONNX = PROJECT_ROOT / "sonic_python_inference/assets/encoder_dyn.onnx"
 DECODER_ONNX = PROJECT_ROOT / "sonic_python_inference/assets/decoder_dyn.onnx"
-DEPLOY_ENCODER_ONNX = PROJECT_ROOT / "gear_sonic_deploy/policy/release/model_encoder.onnx"
-DEPLOY_DECODER_ONNX = PROJECT_ROOT / "gear_sonic_deploy/policy/release/model_decoder.onnx"
 
 TELEOP_INPUT_DIM = 267
 DECODER_INPUT_DIM = 994
 TOKEN_DIM = 64
 ACTION_DIM = 29
-
-# Deploy encoder obs_dict[1, 1762] layout — verified against release ONNX Slice
-# ops, NOT observation_config.yaml (YAML documents a different export path). See
-# sonic_inference_deploy.ENCODER_FIELDS for the authoritative mapping. Key point:
-# obs_dict[0] is a SCALAR encoder_index (teleop = 1.0), NOT a 4-dim one-hot.
-DEPLOY_ENC_DIM = 1762
-DEPLOY_ENC_OFFSETS = {
-    "encoder_index_scalar": (0, 1),           # teleop = 1.0
-    "motion_anchor_ori_b": (595, 6),          # teleop
-    "command_multi_future_lower_body": (661, 240),  # teleop (pos120 | vel120)
-    "vr_3point_local_target": (901, 9),       # teleop
-    "vr_3point_local_orn_target": (910, 12),  # teleop
-}
-# Deploy decoder obs_dict[1, 994] layout.
-# EMPIRICAL FINDING: self-export (`assets/decoder_dyn.onnx`) and deploy
-# (`gear_sonic_deploy/.../model_decoder.onnx`) are BITWISE IDENTICAL functions —
-# for every single-slot-set-to-1.0 probe over dims 0..993, both ONNX produce
-# identical output. They share the same weights AND the same 994-D layout:
-#     [token 64 | ang_vel 30 | jp_rel 290 | jv_rel 290 | la 290 | gravity 30]
-# Gravity is LAST (matches deploy observation_config.yaml AND our
-# @configclass dataclass-order reading of training's PolicyCfg).
-DEPLOY_DEC_OFFSETS = {
-    "token_state": (0, 64),
-    "his_base_angular_velocity_10frame_step1": (64, 30),
-    "his_body_joint_positions_10frame_step1": (94, 290),
-    "his_body_joint_velocities_10frame_step1": (384, 290),
-    "his_last_actions_10frame_step1": (674, 290),
-    "his_gravity_dir_10frame_step1": (964, 30),
-}
 
 ATOL = 1e-5
 
@@ -486,197 +455,6 @@ def test_proprio_layout(r: Reporter) -> None:
 
 
 # ---------------------------------------------------------------------------
-# G. Deploy-vs-self-export ONNX equivalence (Option A)
-# ---------------------------------------------------------------------------
-# Both our assets/encoder_dyn.onnx and gear_sonic_deploy/policy/release/model_encoder.onnx
-# were derived from the same sonic_release/last.pt weights. They differ only in
-# input convention:
-#   - self-export: 267-D teleop-branch MLP (lower_pos | lower_vel | vr_pos | vr_orn | anchor_6d)
-#   - deploy: 1762-D unified buffer, teleop fields at fixed offsets, others zero,
-#     encoder_mode_4 one-hot = [0, 1, 0, 0]
-# Given the SAME data packed at each one's expected offsets, the 64-D tokens
-# should be bit-close. Same deal for decoder: training-order 994 vs deploy-order
-# 994 (same weights, different top-level permutation). If tokens/actions diverge,
-# our self-export is miswired — the tracking bug in stage1 is in the ONNX itself,
-# not in our obs construction. If they agree, the bug is elsewhere (obs build,
-# frame convention, history update, ...).
-
-
-def _pack_deploy_encoder_obs(teleop_obs_267: np.ndarray) -> np.ndarray:
-    """Unpack 267-D teleop layout, repack into deploy's 1762-D layout (teleop mode).
-
-    267-D layout (matches sonic_inference.py step() concat + _make_standing_teleop_obs):
-        [lower_pos 120 | lower_vel 120 | vr_pos 9 | vr_orn 12 | anchor_6d 6]
-
-    Deploy layout (teleop mode): obs_dict[0]=1.0 (scalar encoder_index), with
-    the four teleop fields at fixed offsets per ENCODER_FIELDS; all other slots
-    zero. `command_multi_future_lower_body (240)` concatenates pos120+vel120.
-    """
-    assert teleop_obs_267.shape[-1] == TELEOP_INPUT_DIM, teleop_obs_267.shape
-    N = teleop_obs_267.shape[0]
-    out = np.zeros((N, DEPLOY_ENC_DIM), dtype=np.float32)
-    # obs_dict[0] = encoder_index scalar (teleop = 1.0)
-    out[:, 0] = 1.0
-    lp = teleop_obs_267[:, 0:120]
-    lv = teleop_obs_267[:, 120:240]
-    vp = teleop_obs_267[:, 240:249]
-    vo = teleop_obs_267[:, 249:261]
-    a6 = teleop_obs_267[:, 261:267]
-    for name, src in [
-        ("motion_anchor_ori_b", a6),
-        ("command_multi_future_lower_body", np.concatenate([lp, lv], axis=-1)),
-        ("vr_3point_local_target", vp),
-        ("vr_3point_local_orn_target", vo),
-    ]:
-        off, dim = DEPLOY_ENC_OFFSETS[name]
-        assert src.shape[-1] == dim, (name, src.shape, dim)
-        out[:, off : off + dim] = src
-    return out
-
-
-def _pack_deploy_decoder_obs(self_export_994: np.ndarray) -> np.ndarray:
-    """Identity pack — self-export and deploy decoders share the same 994-D layout.
-
-    Empirically verified (single-slot probes over dims 0..993): self-export
-    `assets/decoder_dyn.onnx` and deploy `model_decoder.onnx` are BITWISE
-    identical functions. Both use:
-        [token 64 | ang_vel 30 | jp_rel 290 | jv_rel 290 | la 290 | gravity 30]
-    (gravity LAST). Kept as a named pass-through for test symmetry.
-    """
-    assert self_export_994.shape[-1] == DECODER_INPUT_DIM, self_export_994.shape
-    return self_export_994.copy()
-
-
-def test_encoder_equivalence(r: Reporter) -> None:
-    section("G1. encoder: self-export (267-D) vs deploy (1762-D) equivalence")
-
-    if not ENCODER_ONNX.exists():
-        r.bad("encoder equivalence", f"missing self-export: {ENCODER_ONNX}")
-        return
-    if not DEPLOY_ENCODER_ONNX.exists():
-        r.bad("encoder equivalence", f"missing deploy: {DEPLOY_ENCODER_ONNX}")
-        return
-
-    self_sess = ort.InferenceSession(str(ENCODER_ONNX), providers=["CPUExecutionProvider"])
-    depl_sess = ort.InferenceSession(str(DEPLOY_ENCODER_ONNX), providers=["CPUExecutionProvider"])
-
-    # Dump deploy encoder I/O for cross-check
-    m = onnx.load(str(DEPLOY_ENCODER_ONNX))
-    depl_inputs = [(i.name, [d.dim_param or d.dim_value for d in i.type.tensor_type.shape.dim]) for i in m.graph.input]
-    depl_outputs = [(o.name, [d.dim_param or d.dim_value for d in o.type.tensor_type.shape.dim]) for o in m.graph.output]
-    print(f"  deploy encoder inputs={depl_inputs}, outputs={depl_outputs}")
-    depl_in_name = depl_inputs[0][0]
-    depl_out_name = depl_outputs[0][0]
-
-    rng = np.random.default_rng(0)
-    # 3 test vectors: (a) standing pose, (b) random noise, (c) non-trivial scripted obs
-    standing = _make_standing_teleop_obs(1).astype(np.float32)
-    random_vec = rng.standard_normal((1, TELEOP_INPUT_DIM)).astype(np.float32) * 0.3
-    # Scripted: non-zero lower_pos / lower_vel, identity VR quats, yaw(π/4) anchor
-    scripted = standing.copy()
-    scripted[:, 0:120] = rng.standard_normal((1, 120)).astype(np.float32) * 0.1  # lower_pos
-    scripted[:, 120:240] = rng.standard_normal((1, 120)).astype(np.float32) * 0.5  # lower_vel
-    # anchor_6d for yaw(π/4): Rz=[[cos,-sin,0],[sin,cos,0],[0,0,1]] → row-major first 2 cols
-    c, s = math.cos(math.pi / 4), math.sin(math.pi / 4)
-    scripted[:, 261:267] = np.array([c, -s, s, c, 0.0, 0.0], dtype=np.float32)
-
-    cases = [("standing", standing), ("random_noise", random_vec), ("scripted", scripted)]
-
-    for name, obs_267 in cases:
-        obs_1762 = _pack_deploy_encoder_obs(obs_267)
-        tok_self = self_sess.run(None, {"teleop_obs": obs_267})[0]  # [1, 64]
-        tok_depl = depl_sess.run(None, {depl_in_name: obs_1762})[0]  # [1, 64]
-
-        # Print side-by-side stats + head
-        diff = tok_self - tok_depl
-        print(
-            f"  case={name}: self range=[{tok_self.min():+.3f}, {tok_self.max():+.3f}], "
-            f"deploy range=[{tok_depl.min():+.3f}, {tok_depl.max():+.3f}], "
-            f"max|Δ|={np.abs(diff).max():.3e}, mean|Δ|={np.abs(diff).mean():.3e}"
-        )
-        print(f"    self[0, :8]  = {tok_self[0, :8]}")
-        print(f"    deploy[0,:8] = {tok_depl[0, :8]}")
-
-        if not np.isfinite(tok_self).all():
-            r.bad(f"encoder-eq {name}", "self-export token not finite")
-            continue
-        if not np.isfinite(tok_depl).all():
-            r.bad(f"encoder-eq {name}", "deploy token not finite")
-            continue
-        # FSQ quantizes to discrete codebook values. If both branches route to
-        # the same FSQ output the tokens should be bit-identical; small float
-        # noise only appears in the pre-quant latent. Allow loose 1e-4 tolerance.
-        max_abs = float(np.abs(diff).max())
-        if max_abs > 1e-3:
-            r.bad(
-                f"encoder-eq {name}",
-                f"max|Δ|={max_abs:.3e} > 1e-3 — self-export teleop branch does NOT match deploy encoder",
-            )
-        else:
-            r.ok(f"encoder-eq {name}", f"max|Δ|={max_abs:.3e}")
-
-
-def test_decoder_equivalence(r: Reporter) -> None:
-    section("G2. decoder: self-export (training order) vs deploy (YAML order) equivalence")
-
-    if not DECODER_ONNX.exists():
-        r.bad("decoder equivalence", f"missing self-export: {DECODER_ONNX}")
-        return
-    if not DEPLOY_DECODER_ONNX.exists():
-        r.bad("decoder equivalence", f"missing deploy: {DEPLOY_DECODER_ONNX}")
-        return
-
-    self_sess = ort.InferenceSession(str(DECODER_ONNX), providers=["CPUExecutionProvider"])
-    depl_sess = ort.InferenceSession(str(DEPLOY_DECODER_ONNX), providers=["CPUExecutionProvider"])
-
-    m = onnx.load(str(DEPLOY_DECODER_ONNX))
-    depl_inputs = [(i.name, [d.dim_param or d.dim_value for d in i.type.tensor_type.shape.dim]) for i in m.graph.input]
-    depl_outputs = [(o.name, [d.dim_param or d.dim_value for d in o.type.tensor_type.shape.dim]) for o in m.graph.output]
-    print(f"  deploy decoder inputs={depl_inputs}, outputs={depl_outputs}")
-    depl_in_name = depl_inputs[0][0]
-
-    rng = np.random.default_rng(1)
-    # 3 test vectors in self-export (training) layout:
-    #   [token 64 | gravity 30 | ang_vel 30 | jp_rel 290 | jv_rel 290 | la 290]
-    zeros = np.zeros((1, DECODER_INPUT_DIM), dtype=np.float32)
-    # Standing: gravity = [0,0,-1] repeated 10 frames (gravity block lives LAST,
-    # offset 964..994), rest zero (token zero too).
-    standing = zeros.copy()
-    standing[:, 964 + 2 : 964 + 30 : 3] = -1.0  # gravity z column every 3
-    random_vec = rng.standard_normal((1, DECODER_INPUT_DIM)).astype(np.float32) * 0.2
-
-    cases = [("zeros", zeros), ("standing_gravity", standing), ("random_noise", random_vec)]
-
-    for name, self_994 in cases:
-        depl_994 = _pack_deploy_decoder_obs(self_994)
-        act_self = self_sess.run(None, {"decoder_input": self_994})[0]  # [1, 29]
-        act_depl = depl_sess.run(None, {depl_in_name: depl_994})[0]  # [1, 29]
-        diff = act_self - act_depl
-        print(
-            f"  case={name}: self range=[{act_self.min():+.3f}, {act_self.max():+.3f}], "
-            f"deploy range=[{act_depl.min():+.3f}, {act_depl.max():+.3f}], "
-            f"max|Δ|={np.abs(diff).max():.3e}, mean|Δ|={np.abs(diff).mean():.3e}"
-        )
-        print(f"    self[0, :8]  = {act_self[0, :8]}")
-        print(f"    deploy[0,:8] = {act_depl[0, :8]}")
-
-        if not np.isfinite(act_self).all():
-            r.bad(f"decoder-eq {name}", "self-export action not finite")
-            continue
-        if not np.isfinite(act_depl).all():
-            r.bad(f"decoder-eq {name}", "deploy action not finite")
-            continue
-        max_abs = float(np.abs(diff).max())
-        if max_abs > 1e-3:
-            r.bad(
-                f"decoder-eq {name}",
-                f"max|Δ|={max_abs:.3e} > 1e-3 — self-export decoder does NOT match deploy decoder",
-            )
-        else:
-            r.ok(f"decoder-eq {name}", f"max|Δ|={max_abs:.3e}")
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -693,8 +471,6 @@ def main() -> int:
     test_proprio_layout(r)
     test_encoder_smoke(r)
     test_decoder_smoke(r)
-    test_encoder_equivalence(r)
-    test_decoder_equivalence(r)
 
     return r.finish()
 

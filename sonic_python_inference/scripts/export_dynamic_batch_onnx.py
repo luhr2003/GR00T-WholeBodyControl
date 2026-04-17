@@ -37,6 +37,13 @@ SMPL_TOKEN_NUM = 2
 SMPL_TOKEN_DIM = 32
 SMPL_FSQ_LEVELS = [32] * 32
 
+# G1 (teacher) encoder: 10 future frames × (29 joint_pos + 29 joint_vel + 6D root rel) = 640
+G1_HIDDEN = [2048, 1024, 512, 512]
+G1_INPUT_DIM = 640
+G1_TOKEN_NUM = 2
+G1_TOKEN_DIM = 32
+G1_FSQ_LEVELS = [32] * 32
+
 DECODER_HIDDEN = [2048, 2048, 1024, 1024, 512, 512]
 DECODER_INPUT_DIM = 994
 DECODER_ACTION_DIM = 29
@@ -70,6 +77,8 @@ def load_state_dict_with_shim(ckpt_path: Path) -> dict:
             out[f"teleop.{k.removeprefix('actor_module.encoders.teleop.module.')}"] = v
         elif k.startswith("actor_module.encoders.smpl.module."):
             out[f"smpl.{k.removeprefix('actor_module.encoders.smpl.module.')}"] = v
+        elif k.startswith("actor_module.encoders.g1.module."):
+            out[f"g1.{k.removeprefix('actor_module.encoders.g1.module.')}"] = v
         elif k.startswith("actor_module.decoders.g1_dyn.module."):
             out[f"g1_dyn.{k.removeprefix('actor_module.decoders.g1_dyn.module.')}"] = v
     return out
@@ -130,6 +139,38 @@ class SmplEncoderWithFSQ(nn.Module):
         return quantized.view(-1, SMPL_TOKEN_NUM * SMPL_TOKEN_DIM)
 
 
+class G1EncoderWithFSQ(nn.Module):
+    """G1 (teacher) obs [N, 640] → MLP → [N, 64] → reshape (N,2,32) → FSQ → flatten → [N, 64].
+
+    The 640-D obs packs 10 future frames (dt=0.1 s) of:
+      * command_multi_future: cat(joint_pos_multi_future, joint_vel_multi_future)
+        — 29+29 = 58 per frame, IL DOF order (commands.py:897-903).
+      * motion_anchor_ori_b_mf: 6D of quat_mul(quat_inv(robot_anchor_quat_w),
+        ref_root_quat_future) — 6 per frame (observations.py:1022-1043,
+        commands.py:1942-1963). ref_root_quat is the robot-retarget root.
+
+    Per-frame concat order: [joint_pos(29), joint_vel(29), anchor_ori_6d(6)] then
+    flatten over 10 frames to 640. See config.yaml encoders.g1.inputs.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.mlp = build_mlp(G1_INPUT_DIM, G1_HIDDEN, G1_TOKEN_NUM * G1_TOKEN_DIM)
+        from vector_quantize_pytorch import FSQ
+
+        self.fsq = FSQ(levels=G1_FSQ_LEVELS)
+
+    def load_from(self, sd: dict):
+        g1_sd = {k.removeprefix("g1."): v for k, v in sd.items() if k.startswith("g1.")}
+        self.mlp.load_state_dict(g1_sd, strict=True)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        latent = self.mlp(obs)
+        latent = latent.view(-1, G1_TOKEN_NUM, G1_TOKEN_DIM)
+        quantized, _ = self.fsq(latent)
+        return quantized.view(-1, G1_TOKEN_NUM * G1_TOKEN_DIM)
+
+
 class G1DynDecoder(nn.Module):
     """[N, 994] (token_flat 64 ‖ proprio 930) → MLP → [N, 29] action."""
 
@@ -170,6 +211,21 @@ def _export_smpl_encoder(model: SmplEncoderWithFSQ, out_path: Path):
         input_names=["smpl_obs"],
         output_names=["token_flattened"],
         dynamic_axes={"smpl_obs": {0: "batch"}, "token_flattened": {0: "batch"}},
+        opset_version=17,
+        do_constant_folding=True,
+    )
+
+
+def _export_g1_encoder(model: G1EncoderWithFSQ, out_path: Path):
+    model.eval()
+    dummy = torch.randn(1, G1_INPUT_DIM)
+    torch.onnx.export(
+        model,
+        (dummy,),
+        str(out_path),
+        input_names=["g1_obs"],
+        output_names=["token_flattened"],
+        dynamic_axes={"g1_obs": {0: "batch"}, "token_flattened": {0: "batch"}},
         opset_version=17,
         do_constant_folding=True,
     )
@@ -222,18 +278,23 @@ def main():
     enc.load_from(sd)
     smpl_enc = SmplEncoderWithFSQ()
     smpl_enc.load_from(sd)
+    g1_enc = G1EncoderWithFSQ()
+    g1_enc.load_from(sd)
     dec = G1DynDecoder()
     dec.load_from(sd)
 
     enc_path = args.out_dir / "encoder_dyn.onnx"
     smpl_enc_path = args.out_dir / "smpl_encoder_dyn.onnx"
+    g1_enc_path = args.out_dir / "g1_encoder_dyn.onnx"
     dec_path = args.out_dir / "decoder_dyn.onnx"
     export_encoder(enc, enc_path)
     _export_smpl_encoder(smpl_enc, smpl_enc_path)
+    _export_g1_encoder(g1_enc, g1_enc_path)
     export_decoder(dec, dec_path)
 
     verify_dynamic(enc_path, "teleop_obs", TELEOP_INPUT_DIM, DECODER_TOKEN_FLAT)
     verify_dynamic(smpl_enc_path, "smpl_obs", SMPL_INPUT_DIM, DECODER_TOKEN_FLAT)
+    verify_dynamic(g1_enc_path, "g1_obs", G1_INPUT_DIM, DECODER_TOKEN_FLAT)
     verify_dynamic(dec_path, "decoder_input", DECODER_INPUT_DIM, DECODER_ACTION_DIM)
 
 

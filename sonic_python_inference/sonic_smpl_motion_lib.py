@@ -110,9 +110,10 @@ class _MotionEntry:
     name: str
     num_frames: int
     # All at TARGET_FPS, CPU torch tensors for flexible later device transfer.
-    smpl_joints: torch.Tensor           # [T, 24, 3]
-    smpl_root_quat_w: torch.Tensor      # [T, 4] wxyz, Z-up, base-rot removed
+    smpl_joints: torch.Tensor | None    # [T, 24, 3]  (None in robot-only mode)
+    smpl_root_quat_w: torch.Tensor | None  # [T, 4] wxyz Z-up base-rot-removed
     dof_pos_il: torch.Tensor            # [T, 29] IsaacLab order
+    dof_vel_il: torch.Tensor            # [T, 29] finite-diff at TARGET_FPS
     robot_root_pos_w: torch.Tensor      # [T, 3]
     robot_root_quat_w_wxyz: torch.Tensor  # [T, 4] converted from pkl xyzw
 
@@ -127,23 +128,34 @@ class SmplMotionLib:
 
     def __init__(
         self,
-        smpl_dir: str | Path,
+        smpl_dir: str | Path | None,
         robot_dir: str | Path,
         motion_names: list[str],
         device: str | torch.device = "cuda",
         smpl_y_up: bool = True,
         wrist_dof_idx: tuple[int, ...] = DEFAULT_WRIST_DOF_IDX,
         num_future_frames: int = 10,
+        dt_future_ref_frames: float = SMPL_DT_FUTURE_REF_FRAMES,
+        need_smpl: bool = True,
     ):
-        self.smpl_dir = Path(smpl_dir)
+        """If `need_smpl=False`, `smpl_dir` is ignored and the SMPL pkl is not
+        loaded — used by the G1 path which only needs `robot_filtered/*.pkl`."""
+        self.smpl_dir = Path(smpl_dir) if smpl_dir is not None else None
         self.robot_dir = Path(robot_dir)
         self.device = torch.device(device)
         self.smpl_y_up = smpl_y_up
         self.wrist_dof_idx = wrist_dof_idx
         self.num_future_frames = num_future_frames
         self.target_fps = TARGET_FPS
-        # frame_skip = smpl_dt_future_ref_frames * target_fps = 0.02 * 50 = 1
-        self.frame_skip = int(round(SMPL_DT_FUTURE_REF_FRAMES * TARGET_FPS))
+        self.need_smpl = need_smpl
+        # frame_skip = dt_future_ref_frames * target_fps
+        # SMPL path: 0.02 * 50 = 1   |   G1 path: 0.1 * 50 = 5
+        self.frame_skip = int(round(dt_future_ref_frames * TARGET_FPS))
+        if self.frame_skip < 1:
+            raise ValueError(
+                f"frame_skip must be ≥ 1 (got {self.frame_skip} from "
+                f"dt_future_ref_frames={dt_future_ref_frames} at {TARGET_FPS} Hz)"
+            )
 
         self.motions: list[_MotionEntry] = [self._load_pair(n) for n in motion_names]
         self.motion_num_steps = torch.tensor(
@@ -157,32 +169,23 @@ class SmplMotionLib:
             * self.frame_skip
         )
 
-    def _load_pair(self, name: str) -> _MotionEntry:
-        smpl_path = self.smpl_dir / f"{name}.pkl"
+    def _load_robot(self, name: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Load + resample + MJ→IL + xyzw→wxyz for the robot pkl only.
+
+        Returns (dof_il [T,29], root_pos [T,3], root_quat_wxyz [T,4]), all at
+        TARGET_FPS. Shared by SMPL+robot path and G1-only path."""
         robot_candidates = sorted(self.robot_dir.rglob(f"{name}.pkl"))
         if not robot_candidates:
             raise FileNotFoundError(f"No robot pkl for motion '{name}' under {self.robot_dir}")
-        robot_path = robot_candidates[0]
-
-        smpl = joblib.load(smpl_path)
-        robot_outer = joblib.load(robot_path)
-        # Robot pkl is wrapped as {name: {...}}
+        robot_outer = joblib.load(robot_candidates[0])
         if isinstance(robot_outer, dict) and name in robot_outer:
             robot = robot_outer[name]
         else:
             robot = next(iter(robot_outer.values())) if isinstance(robot_outer, dict) else robot_outer
 
-        pose_aa = np.asarray(smpl["pose_aa"], dtype=np.float32)  # [T_smpl, 72]
-        smpl_joints = np.asarray(smpl["smpl_joints"], dtype=np.float32)  # [T_smpl, 24, 3]
-        smpl_fps = float(smpl["fps"])
-        if abs(smpl_fps - TARGET_FPS) > 1e-6:
-            pose_aa = _linear_resample(pose_aa, smpl_fps, TARGET_FPS)
-            smpl_joints = _linear_resample(smpl_joints, smpl_fps, TARGET_FPS)
-
-        dof_mj = np.asarray(robot["dof"], dtype=np.float32)  # [T_rob, 29] MuJoCo order
-        robot_root_pos = np.asarray(robot["root_trans_offset"], dtype=np.float32)  # [T_rob, 3]
-        # Robot pkl stores root_rot as xyzw; Isaac Lab uses wxyz
-        robot_root_quat_xyzw = np.asarray(robot["root_rot"], dtype=np.float32)  # [T_rob, 4]
+        dof_mj = np.asarray(robot["dof"], dtype=np.float32)  # [T, 29] MuJoCo order
+        robot_root_pos = np.asarray(robot["root_trans_offset"], dtype=np.float32)
+        robot_root_quat_xyzw = np.asarray(robot["root_rot"], dtype=np.float32)
         robot_root_quat_wxyz = np.concatenate(
             [robot_root_quat_xyzw[:, 3:4], robot_root_quat_xyzw[:, :3]], axis=-1
         )
@@ -191,33 +194,68 @@ class SmplMotionLib:
             dof_mj = _linear_resample(dof_mj, robot_fps, TARGET_FPS)
             robot_root_pos = _linear_resample(robot_root_pos, robot_fps, TARGET_FPS)
             robot_root_quat_wxyz = _linear_resample(robot_root_quat_wxyz, robot_fps, TARGET_FPS)
-            # renormalize after linear interp
             robot_root_quat_wxyz /= np.linalg.norm(
                 robot_root_quat_wxyz, axis=-1, keepdims=True
             ).clip(min=1e-9)
         dof_il = dof_mj[:, G1_MUJOCO_TO_ISAACLAB_DOF]
+        return dof_il, robot_root_pos, robot_root_quat_wxyz
 
-        # Align frame counts (they should match after interpolation; pick min)
-        T = min(pose_aa.shape[0], smpl_joints.shape[0], dof_il.shape[0], robot_root_pos.shape[0])
-        pose_aa = pose_aa[:T]
-        smpl_joints = smpl_joints[:T]
-        dof_il = dof_il[:T]
-        robot_root_pos = robot_root_pos[:T]
-        robot_root_quat_wxyz = robot_root_quat_wxyz[:T]
+    @staticmethod
+    def _compute_dof_vel(dof_il: np.ndarray, fps: float) -> np.ndarray:
+        """Finite-diff dof_vel, padding last frame by repeat.
 
-        # Root quat: pose_aa[:, :3] → quat wxyz, Y→Z up, remove_smpl_base_rot
-        root_aa_t = torch.from_numpy(pose_aa[:, :3])
-        root_quat = _angle_axis_to_quat_wxyz(root_aa_t)
-        if self.smpl_y_up:
-            root_quat = _ytoz_up_wxyz(root_quat)
-        root_quat = _remove_smpl_base_rot_wxyz(root_quat)
+        Matches training-side convention at
+        `gear_sonic/utils/motion_lib/torch_humanoid_batch.py:449-450`:
+            dof_vel = (dof_pos[1:] - dof_pos[:-1]) / dt
+            dof_vel = cat([dof_vel, dof_vel[-1:]])
+        """
+        dt = 1.0 / fps
+        if dof_il.shape[0] < 2:
+            return np.zeros_like(dof_il)
+        dv = (dof_il[1:] - dof_il[:-1]) / dt
+        return np.concatenate([dv, dv[-1:]], axis=0).astype(np.float32)
 
+    def _load_pair(self, name: str) -> _MotionEntry:
+        dof_il, robot_root_pos, robot_root_quat_wxyz = self._load_robot(name)
+        dof_vel_il = self._compute_dof_vel(dof_il, TARGET_FPS)
+
+        smpl_joints_t = None
+        smpl_root_quat_t = None
+        if self.need_smpl:
+            if self.smpl_dir is None:
+                raise ValueError("need_smpl=True but smpl_dir is None")
+            smpl = joblib.load(self.smpl_dir / f"{name}.pkl")
+            pose_aa = np.asarray(smpl["pose_aa"], dtype=np.float32)
+            smpl_joints = np.asarray(smpl["smpl_joints"], dtype=np.float32)
+            smpl_fps = float(smpl["fps"])
+            if abs(smpl_fps - TARGET_FPS) > 1e-6:
+                pose_aa = _linear_resample(pose_aa, smpl_fps, TARGET_FPS)
+                smpl_joints = _linear_resample(smpl_joints, smpl_fps, TARGET_FPS)
+
+            T_min = min(pose_aa.shape[0], smpl_joints.shape[0], dof_il.shape[0])
+            pose_aa = pose_aa[:T_min]
+            smpl_joints = smpl_joints[:T_min]
+            dof_il = dof_il[:T_min]
+            dof_vel_il = dof_vel_il[:T_min]
+            robot_root_pos = robot_root_pos[:T_min]
+            robot_root_quat_wxyz = robot_root_quat_wxyz[:T_min]
+
+            root_aa_t = torch.from_numpy(pose_aa[:, :3])
+            root_quat = _angle_axis_to_quat_wxyz(root_aa_t)
+            if self.smpl_y_up:
+                root_quat = _ytoz_up_wxyz(root_quat)
+            root_quat = _remove_smpl_base_rot_wxyz(root_quat)
+            smpl_joints_t = torch.from_numpy(smpl_joints).to(self.device)
+            smpl_root_quat_t = root_quat.to(self.device)
+
+        T = dof_il.shape[0]
         return _MotionEntry(
             name=name,
             num_frames=T,
-            smpl_joints=torch.from_numpy(smpl_joints).to(self.device),
-            smpl_root_quat_w=root_quat.to(self.device),
+            smpl_joints=smpl_joints_t,
+            smpl_root_quat_w=smpl_root_quat_t,
             dof_pos_il=torch.from_numpy(dof_il).to(self.device),
+            dof_vel_il=torch.from_numpy(dof_vel_il).to(self.device),
             robot_root_pos_w=torch.from_numpy(robot_root_pos).to(self.device),
             robot_root_quat_w_wxyz=torch.from_numpy(robot_root_quat_wxyz).to(self.device),
         )
@@ -234,14 +272,21 @@ class SmplMotionLib:
             "dof_pos_il": dof_pos,           # [N, 29]
         }
 
+    def _clipped_abs_idx(self, time_steps: torch.Tensor) -> torch.Tensor:
+        """[N, F] absolute frame indices for the future window, clipped per motion."""
+        assert time_steps.shape == (len(self.motions),)
+        time_steps = time_steps.to(self.device).long()
+        abs_idx = time_steps[:, None] + self.future_offsets[None, :]
+        return torch.minimum(abs_idx, self.motion_num_steps[:, None] - 1)
+
     def sample_future(
         self,
         time_steps: torch.Tensor,  # [N] long, current policy tick per env
     ) -> dict[str, torch.Tensor]:
-        """Return a dict of future-frame tensors for a 10-frame window.
+        """Return a dict of future-frame tensors for the SMPL encoder.
 
         Indices are clipped to each motion's last valid frame (same as
-        commands.py `smpl_future_time_steps`).
+        commands.py `smpl_future_time_steps`). Requires `need_smpl=True`.
 
         Returns:
             smpl_joints_future_w:       [N, F, 24, 3]
@@ -249,14 +294,10 @@ class SmplMotionLib:
             wrist_dof_future:           [N, F, 6]         IL indices wrist_dof_idx
             dof_pos_ref:                [N, 29]           IL order, current frame (for debugging)
         """
-        assert time_steps.shape == (len(self.motions),)
-        time_steps = time_steps.to(self.device).long()
-        F = self.num_future_frames
-        N = time_steps.shape[0]
-
-        # [N, F] absolute indices, clipped per-motion
-        abs_idx = time_steps[:, None] + self.future_offsets[None, :]
-        abs_idx = torch.minimum(abs_idx, self.motion_num_steps[:, None] - 1)
+        if not self.need_smpl:
+            raise RuntimeError("sample_future requires need_smpl=True (use sample_future_robot instead)")
+        abs_idx = self._clipped_abs_idx(time_steps)
+        N, F = abs_idx.shape
 
         smpl_joints_future = torch.empty(
             N, F, SMPL_NUM_JOINTS, 3, device=self.device, dtype=torch.float32
@@ -268,6 +309,7 @@ class SmplMotionLib:
             N, F, len(self.wrist_dof_idx), device=self.device, dtype=torch.float32
         )
         dof_pos_ref = torch.empty(N, 29, device=self.device, dtype=torch.float32)
+        time_steps = time_steps.to(self.device).long()
 
         for i, motion in enumerate(self.motions):
             idx = abs_idx[i]
@@ -280,5 +322,40 @@ class SmplMotionLib:
             "smpl_joints_future_w": smpl_joints_future,
             "smpl_root_quat_future_w_wxyz": smpl_root_quat_future,
             "wrist_dof_future": wrist_dof_future,
+            "dof_pos_ref": dof_pos_ref,
+        }
+
+    def sample_future_robot(
+        self,
+        time_steps: torch.Tensor,  # [N] long, current policy tick per env
+    ) -> dict[str, torch.Tensor]:
+        """Future-frame tensors for the G1 encoder (robot retarget only).
+
+        Returns:
+            joint_pos_future:           [N, F, 29]       IL-order ref dof
+            joint_vel_future:           [N, F, 29]       IL-order ref dof_vel (finite-diff)
+            robot_root_quat_future_wxyz:[N, F, 4]        robot pkl root_rot, xyzw→wxyz
+            dof_pos_ref:                [N, 29]          IL order, current frame (debug)
+        """
+        abs_idx = self._clipped_abs_idx(time_steps)
+        N, F = abs_idx.shape
+
+        joint_pos_future = torch.empty(N, F, 29, device=self.device, dtype=torch.float32)
+        joint_vel_future = torch.empty(N, F, 29, device=self.device, dtype=torch.float32)
+        robot_root_quat_future = torch.empty(N, F, 4, device=self.device, dtype=torch.float32)
+        dof_pos_ref = torch.empty(N, 29, device=self.device, dtype=torch.float32)
+        time_steps = time_steps.to(self.device).long()
+
+        for i, motion in enumerate(self.motions):
+            idx = abs_idx[i]
+            joint_pos_future[i] = motion.dof_pos_il[idx]
+            joint_vel_future[i] = motion.dof_vel_il[idx]
+            robot_root_quat_future[i] = motion.robot_root_quat_w_wxyz[idx]
+            dof_pos_ref[i] = motion.dof_pos_il[time_steps[i].clamp(max=motion.num_frames - 1)]
+
+        return {
+            "joint_pos_future": joint_pos_future,
+            "joint_vel_future": joint_vel_future,
+            "robot_root_quat_future_wxyz": robot_root_quat_future,
             "dof_pos_ref": dof_pos_ref,
         }
