@@ -1,28 +1,32 @@
-"""Stage hybrid kneel: hybrid planner+PinkIK → G1 encoder.
+"""Stage hybrid IK, MagicSim-USD variant.
 
-Two-phase state machine: **crouch for `--crouch-steps` policy steps, then
-stand back up** (idle, height disabled). Crouch mode is chosen via
-`--kneel-mode {one_leg,two_leg,squat}`. Two VisualCuboid wrist targets
-auto-track the pelvis as the robot drops and rise again on stand-up.
+Same semantics as `stage_hybrid_ik.py` — kinematic planner → lower 12,
+Pink IK → upper 17, G1 encoder + decoder → motor targets, driven by cube
+targets in pelvis frame — but spawns the robot from MagicSim's
+`g1_new.usd` (copied to `assets/g1_magicsim.usd`) via `UsdFileCfg` instead
+of converting SONIC's URDF on the fly.
 
-Pipeline identical to `stage_hybrid_eval.py`:
-    planner (lower 12) + Pink IK (upper 17) → G1 encoder → decoder → PD
+Key difference: `g1_new.usd` exposes 43 joints (29 SONIC body DOFs + 14
+dex-finger joints), whereas SONIC's `main.urdf` exposes only the 29 body
+DOFs. SONIC's policy is 29-DOF; the extra 14 finger joints are driven
+outside the policy loop and here are held at their default (0) positions.
 
-What differs:
-- Crouch phase (`t < --crouch-steps`): planner `mode` = 4/5/6, `target_vel = 0`,
-  `height = --kneel-height` (kneel 0.2–0.4m; squat 0.4–0.8m).
-- Stand phase (`t >= --crouch-steps`): planner `mode = 0` (idle),
-  `height = -1` (disabled) — planner replans the upward transition because
-  mode/height changed (unconditional replan per planner docs).
-- Cubes' world Z is rewritten each tick to `pelvis_z + current_rest_z`,
-  where `current_rest_z` is the kneel-scaled value during crouch and the
-  standing value during stand. X/Y stay user-draggable.
-- Left vs right knee (one_leg mode) is chosen by the planner — flip
-  `--random-seed` to swap sides.
+Pipeline boundary with the 43-joint robot:
+    robot.data.joint_pos[:, body_idx_full_29]          → policy input  (29)
+    policy target [N, 29]  →  full target [N, 43]       → set_joint_position_target
+                                     └─ finger slots = default_joint_pos
+
+All kp/kd/armature/effort/velocity limits come from
+`G1_CYLINDER_MODEL_12_DEX_CFG.actuators`. We swap ONLY `spawn` to a
+`UsdFileCfg`; the `actuators={...}` regex patterns (`.*_hip_.*_joint`,
+etc.) also match dex fingers via `.*_hand_.*_joint` absence? — they do not,
+which means the dex-finger joints have NO ImplicitActuator attached and
+will use PhysX defaults (near-zero stiffness). For the SONIC policy loop
+this is fine: we only care about body-29 PD tracking.
 
 Usage:
-    uv run --active python -m sonic_python_inference.scripts.stage_hybrid_kneel \\
-        --num-envs 1 --kneel-mode two_leg --crouch-steps 200
+    uv run --active python -m sonic_python_inference.scripts.stage_hybrid_ik_magicsim \\
+        --num-envs 1 --headless
 """
 
 from __future__ import annotations
@@ -33,26 +37,10 @@ import re
 import numpy as np
 
 
-# Mode indices from docs/source/references/planner_onnx.md — not exported from
-# sonic_inference.py so we inline them here.
-PLANNER_MODE_SQUAT = 4          # valid height range ~0.4–0.8m
-PLANNER_MODE_KNEEL_TWO_LEG = 5  # valid height range 0.2–0.4m
-PLANNER_MODE_KNEEL_ONE_LEG = 6  # valid height range 0.2–0.4m
-CROUCH_MODE_TABLE = {
-    "one_leg": PLANNER_MODE_KNEEL_ONE_LEG,
-    "two_leg": PLANNER_MODE_KNEEL_TWO_LEG,
-    "squat":   PLANNER_MODE_SQUAT,
-}
-CROUCH_DEFAULT_HEIGHT = {
-    "one_leg": 0.2,
-    "two_leg": 0.2,
-    "squat":   0.5,
-}
-
-
 def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--num-envs", type=int, default=1)
+    ap.add_argument("--episode-sec", type=float, default=30.0)
     ap.add_argument("--headless", action="store_true")
     ap.add_argument(
         "--g1-encoder-onnx",
@@ -75,29 +63,21 @@ def _parse_args() -> argparse.Namespace:
         default="sonic_python_inference/assets/g1_pink_ik.urdf",
     )
     ap.add_argument(
-        "--kneel-mode", type=str, default="one_leg",
-        choices=list(CROUCH_MODE_TABLE.keys()),
-        help="one_leg=mode6 kneelOneLeg; two_leg=mode5 kneelTwoLeg; squat=mode4.",
+        "--magicsim-usd-path",
+        type=str,
+        default=None,
+        help="Override path to the MagicSim USD (default: "
+        "sonic_python_inference/assets/g1_magicsim.usd).",
     )
-    ap.add_argument(
-        "--kneel-height", type=float, default=None,
-        help=("Target pelvis height (m). Defaults: 0.2 for kneel modes (valid "
-              "0.2–0.4), 0.5 for squat (valid 0.4–0.8)."),
-    )
-    ap.add_argument(
-        "--crouch-steps", type=int, default=1000,
-        help=("Policy steps to hold the crouch pose before standing back up. "
-              "At POLICY_HZ=50, 1000 steps = 20.0s."),
-    )
-    ap.add_argument(
-        "--random-seed", type=int, default=0,
-        help="Planner random seed — flip to swap which knee goes down (one_leg only).",
-    )
+    ap.add_argument("--target-vel", type=float, default=0.0)
     return ap.parse_args()
 
 
 args = _parse_args()
 
+# ---------------------------------------------------------------------------
+# AppLauncher must come before any other isaaclab import.
+# ---------------------------------------------------------------------------
 from isaaclab.app import AppLauncher  # noqa: E402
 
 app_launcher = AppLauncher(headless=args.headless)
@@ -118,6 +98,11 @@ from gear_sonic.envs.manager_env.robots.g1 import (  # noqa: E402
     G1_ISAACLAB_TO_MUJOCO_DOF,
     G1_MODEL_12_ACTION_SCALE,
     G1_MUJOCO_TO_ISAACLAB_DOF,
+)
+
+from sonic_python_inference.g1_magicsim_cfg import (  # noqa: E402
+    DEFAULT_MAGICSIM_USD_PATH,
+    make_g1_magicsim_cfg,
 )
 
 from sonic_python_inference.sonic_inference import (  # noqa: E402
@@ -157,16 +142,34 @@ LEG_NAME_PATTERNS = (
     r".*_knee_joint",
     r".*_ankle_.*_joint",
 )
+HAND_RE = re.compile(r".*_hand_.*_joint")
+
+_ROBOT_DEFAULT_Z = 0.793
+_RIGHT_CUBE_POS = (
+    RIGHT_WRIST_REST_POSE_PELVIS[0],
+    RIGHT_WRIST_REST_POSE_PELVIS[1],
+    RIGHT_WRIST_REST_POSE_PELVIS[2] + _ROBOT_DEFAULT_Z,
+)
+_LEFT_CUBE_POS = (
+    LEFT_WRIST_REST_POSE_PELVIS[0],
+    LEFT_WRIST_REST_POSE_PELVIS[1],
+    LEFT_WRIST_REST_POSE_PELVIS[2] + _ROBOT_DEFAULT_Z,
+)
+
+
+_USD_PATH = args.magicsim_usd_path or DEFAULT_MAGICSIM_USD_PATH
+print(f"[info] spawning robot from MagicSim USD: {_USD_PATH}")
+_ROBOT_CFG = make_g1_magicsim_cfg(_USD_PATH)
 
 
 @configclass
-class HybridKneelSceneCfg(InteractiveSceneCfg):
+class HybridIKMagicsimSceneCfg(InteractiveSceneCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="plane",
         collision_group=-1,
     )
-    robot = G1_CYLINDER_MODEL_12_DEX_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot = _ROBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
     dome_light = AssetBaseCfg(
         prim_path="/World/DomeLight",
         spawn=sim_utils.DomeLightCfg(color=(1.0, 1.0, 1.0), intensity=2000.0),
@@ -174,7 +177,9 @@ class HybridKneelSceneCfg(InteractiveSceneCfg):
 
 
 def _action_scale_il(joint_names: list[str]) -> np.ndarray:
-    scale = np.ones(NUM_JOINTS, dtype=np.float32)
+    """Resolve per-joint action scales for the 29 BODY joints. The caller
+    passes body-only names (fingers are stripped upstream)."""
+    scale = np.ones(len(joint_names), dtype=np.float32)
     patterns = [(re.compile(p), v) for p, v in G1_MODEL_12_ACTION_SCALE.items()]
     for i, name in enumerate(joint_names):
         for pat, v in patterns:
@@ -191,6 +196,14 @@ def _leg_indices_il(joint_names: list[str]) -> list[int]:
     return [i for i, n in enumerate(joint_names) if any(r.fullmatch(n) for r in leg_re)]
 
 
+def _quat_rotate_inv(q_wxyz: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    q_inv = quat_conjugate(q_wxyz)
+    w = q_inv[..., 0:1]
+    xyz = q_inv[..., 1:4]
+    t = 2.0 * torch.cross(xyz, v, dim=-1)
+    return v + w * t + torch.cross(xyz, t, dim=-1)
+
+
 def _build_planner_feeds(
     ctx_np: np.ndarray,
     mode: int,
@@ -199,7 +212,6 @@ def _build_planner_feeds(
     target_vel: float,
     height: float,
     num_envs: int,
-    random_seed: int = 0,
 ) -> list[dict[str, np.ndarray]]:
     feeds: list[dict[str, np.ndarray]] = []
     allowed_mask = ALLOWED_PRED_NUM_TOKENS.reshape(1, 11)
@@ -210,7 +222,7 @@ def _build_planner_feeds(
             "mode": np.array([mode], dtype=np.int64),
             "movement_direction": movement_dir.reshape(1, 3).astype(np.float32),
             "facing_direction": facing_dir.reshape(1, 3).astype(np.float32),
-            "random_seed": np.array([random_seed], dtype=np.int64),
+            "random_seed": np.array([0], dtype=np.int64),
             "has_specific_target": np.zeros((1, 1), dtype=np.int64),
             "specific_target_positions": np.zeros((1, 4, 3), dtype=np.float32),
             "specific_target_headings": np.zeros((1, 4), dtype=np.float32),
@@ -237,25 +249,6 @@ def _context_from_cache(cache: torch.Tensor, playback_idx: torch.Tensor) -> torc
     return torch.cat([pos, quat, joints], dim=-1)
 
 
-def _lowered_rest_pose(
-    base_rest: tuple[float, ...], target_height: float,
-) -> tuple[float, ...]:
-    """Scale the pelvis-frame Z of the standing rest pose proportionally
-    with the planner's target pelvis height. X/Y and the identity quat stay.
-
-    Example: standing rest Z = 0.14523 (hand ~15 cm above pelvis at 0.789
-    standing height). At kneel height 0.3 the scale becomes 0.38 → adjusted
-    rest Z = 0.055 (hand just above the lowered pelvis). Prevents the
-    standing rest target from floating way above the head once the pelvis
-    drops during a kneel/squat.
-    """
-    if target_height <= 0.0:
-        return base_rest
-    scale = target_height / PLANNER_CONTEXT_DEFAULT_HEIGHT
-    x, y, z = base_rest[0], base_rest[1], base_rest[2] * scale
-    return (x, y, z, base_rest[3], base_rest[4], base_rest[5], base_rest[6])
-
-
 def main():
     device = "cpu"
 
@@ -263,19 +256,55 @@ def main():
     sim = sim_utils.SimulationContext(sim_cfg)
     sim.set_camera_view([3.0, 3.0, 2.0], [0.0, 0.0, 0.75])
 
-    scene_cfg = HybridKneelSceneCfg(num_envs=args.num_envs, env_spacing=3.0)
+    scene_cfg = HybridIKMagicsimSceneCfg(num_envs=args.num_envs, env_spacing=3.0)
     scene = InteractiveScene(scene_cfg)
     sim.reset()
     robot = scene["robot"]
     scene.update(dt=0.0)
 
-    il_joint_names = list(robot.data.joint_names)
-    default_joint_pos_il = robot.data.default_joint_pos[0].cpu().numpy().astype(np.float32)
-    action_scale_il = _action_scale_il(il_joint_names)
+    env_origins_np = scene.env_origins.cpu().numpy()
+    right_cubes: list[VisualCuboid] = []
+    left_cubes: list[VisualCuboid] = []
+    for i in range(args.num_envs):
+        origin = env_origins_np[i]
+        right_cubes.append(
+            VisualCuboid(
+                prim_path=f"/World/envs/env_{i}/RightTargetCube",
+                name=f"right_target_cube_{i}",
+                position=np.array(_RIGHT_CUBE_POS, dtype=np.float32) + origin,
+                size=0.06,
+                color=np.array([0.9, 0.1, 0.1], dtype=np.float32),
+            )
+        )
+        left_cubes.append(
+            VisualCuboid(
+                prim_path=f"/World/envs/env_{i}/LeftTargetCube",
+                name=f"left_target_cube_{i}",
+                position=np.array(_LEFT_CUBE_POS, dtype=np.float32) + origin,
+                size=0.06,
+                color=np.array([0.1, 0.3, 0.9], dtype=np.float32),
+            )
+        )
 
-    leg_idx_il = _leg_indices_il(il_joint_names)
+    full_joint_names = list(robot.data.joint_names)
+    print(f"[info] full joint list (len={len(full_joint_names)}): {full_joint_names}")
+
+    # Body joints = all non-hand joints. SONIC's policy is 29-DOF.
+    body_idx_full = [i for i, n in enumerate(full_joint_names) if not HAND_RE.fullmatch(n)]
+    body_joint_names = [full_joint_names[i] for i in body_idx_full]
+    assert len(body_idx_full) == NUM_JOINTS, (
+        f"expected {NUM_JOINTS} body joints, got {len(body_idx_full)}"
+    )
+    body_idx_t = torch.as_tensor(body_idx_full, dtype=torch.long, device=device)
+    print(f"[info] body joints (IL order, len={NUM_JOINTS}): {body_joint_names}")
+
+    default_jp_full = robot.data.default_joint_pos[0].cpu().numpy().astype(np.float32)
+    default_joint_pos_il = default_jp_full[body_idx_full]
+    action_scale_il = _action_scale_il(body_joint_names)
+
+    leg_idx_il = _leg_indices_il(body_joint_names)
     assert len(leg_idx_il) == 12
-    upper_idx_il = [il_joint_names.index(n) for n in PINK_CONTROLLED_JOINTS_IL]
+    upper_idx_il = [body_joint_names.index(n) for n in PINK_CONTROLLED_JOINTS_IL]
     assert set(leg_idx_il) | set(upper_idx_il) == set(range(NUM_JOINTS))
     leg_idx_il_t = torch.as_tensor(leg_idx_il, dtype=torch.long, device=device)
     upper_idx_il_t = torch.as_tensor(upper_idx_il, dtype=torch.long, device=device)
@@ -284,7 +313,7 @@ def main():
     mj_to_il = torch.as_tensor(G1_MUJOCO_TO_ISAACLAB_DOF, dtype=torch.long, device=device)
     leg_mj_slots = mj_to_il[leg_idx_il_t]
 
-    # --- Planner infra ---------------------------------------------------
+    # --- Planner ---------------------------------------------------------
     planner_pool = PlannerSessionPool(
         args.planner_onnx, pool_size=args.num_envs, device_id=0, serial=False
     )
@@ -307,7 +336,7 @@ def main():
     movement_dir = np.array([1.0, 0.0, 0.0], dtype=np.float32)
     facing_dir = np.array([1.0, 0.0, 0.0], dtype=np.float32)
 
-    # --- G1 encoder + Pink IK --------------------------------------------
+    # --- G1 encoder + Pink IK -------------------------------------------
     infer = SonicG1Inference(
         num_envs=args.num_envs,
         g1_encoder_onnx=args.g1_encoder_onnx,
@@ -316,125 +345,69 @@ def main():
         action_scale=action_scale_il,
         device=device,
     )
+    # Pink IK uses the mesh-free URDF at --urdf-path (body-only kinematics);
+    # robot_cfg is only consulted for joint metadata, so keep the URDF cfg.
     pink_driver = PinkIKDriver(
         num_envs=args.num_envs,
         robot_cfg=G1_CYLINDER_MODEL_12_DEX_CFG,
         urdf_path=args.urdf_path,
-        all_joint_names_il=il_joint_names,
+        all_joint_names_il=body_joint_names,
         device=device,
         dt=1.0 / POLICY_HZ,
     )
 
-    # Seed sim at default stand.
+    # --- Seed sim at default --------------------------------------------
     root_state = robot.data.default_root_state.clone()
     root_state[:, 0:3] += scene.env_origins
     root_state[:, 7:13] = 0.0
-    joint_pos_init = robot.data.default_joint_pos.clone()
-    joint_vel_init = torch.zeros_like(joint_pos_init)
+    joint_pos_init_full = robot.data.default_joint_pos.clone()
+    joint_vel_init_full = torch.zeros_like(joint_pos_init_full)
+
     robot.write_root_state_to_sim(root_state)
-    robot.write_joint_state_to_sim(joint_pos_init, joint_vel_init)
-    robot.set_joint_position_target(joint_pos_init)
+    robot.write_joint_state_to_sim(joint_pos_init_full, joint_vel_init_full)
+    robot.set_joint_position_target(joint_pos_init_full)
     scene.write_data_to_sim()
     scene.update(dt=0.0)
 
-    infer.reset(joint_pos=joint_pos_init)
+    infer.reset(joint_pos=joint_pos_init_full[:, body_idx_t])
 
-    # Resolve crouch height (mode-dependent default) and rest-Z for both phases.
-    kneel_height = (
-        args.kneel_height if args.kneel_height is not None
-        else CROUCH_DEFAULT_HEIGHT[args.kneel_mode]
-    )
-    left_rest = _lowered_rest_pose(LEFT_WRIST_REST_POSE_PELVIS, kneel_height)
-    rest_z_crouch = left_rest[2]            # scaled Z while crouched
-    rest_z_stand = LEFT_WRIST_REST_POSE_PELVIS[2]  # standing rest Z
-    kneel_mode_id = CROUCH_MODE_TABLE[args.kneel_mode]
-    print(
-        f"[info] crouch phase: mode={kneel_mode_id} ({args.kneel_mode}), "
-        f"height={kneel_height}m, hold={args.crouch_steps} steps "
-        f"({args.crouch_steps / POLICY_HZ:.2f}s), seed={args.random_seed}.\n"
-        f"[info] stand phase: mode={PLANNER_MODE_IDLE} (idle), "
-        f"height=disabled. rest_z crouch={rest_z_crouch:.4f} / stand={rest_z_stand:.4f}."
-    )
-
-    # Spawn two VisualCuboids at the standing rest world position; script
-    # rewrites their Z each tick to track the pelvis as it drops.
-    root_pos_w_init = (
-        robot.data.root_state_w[:, 0:3] - scene.env_origins
-    ).cpu().numpy()
-    env_origins_np = scene.env_origins.cpu().numpy()
-    right_cubes: list[VisualCuboid] = []
-    left_cubes: list[VisualCuboid] = []
-    for i in range(args.num_envs):
-        origin = env_origins_np[i]
-        # Spawn at standing world pose (pelvis_z_default + rest_z_standing).
-        right_world_init = (
-            float(root_pos_w_init[i, 0]) + RIGHT_WRIST_REST_POSE_PELVIS[0] + origin[0],
-            float(root_pos_w_init[i, 1]) + RIGHT_WRIST_REST_POSE_PELVIS[1] + origin[1],
-            float(root_pos_w_init[i, 2]) + RIGHT_WRIST_REST_POSE_PELVIS[2] + origin[2],
-        )
-        left_world_init = (
-            float(root_pos_w_init[i, 0]) + LEFT_WRIST_REST_POSE_PELVIS[0] + origin[0],
-            float(root_pos_w_init[i, 1]) + LEFT_WRIST_REST_POSE_PELVIS[1] + origin[1],
-            float(root_pos_w_init[i, 2]) + LEFT_WRIST_REST_POSE_PELVIS[2] + origin[2],
-        )
-        right_cubes.append(
-            VisualCuboid(
-                prim_path=f"/World/envs/env_{i}/RightTargetCube",
-                name=f"right_target_cube_{i}",
-                position=np.array(right_world_init, dtype=np.float32),
-                size=0.06,
-                color=np.array([0.9, 0.1, 0.1], dtype=np.float32),
-            )
-        )
-        left_cubes.append(
-            VisualCuboid(
-                prim_path=f"/World/envs/env_{i}/LeftTargetCube",
-                name=f"left_target_cube_{i}",
-                position=np.array(left_world_init, dtype=np.float32),
-                size=0.06,
-                color=np.array([0.1, 0.3, 0.9], dtype=np.float32),
-            )
-        )
-
-    def _quat_rotate_inv(q_wxyz: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        q_inv = quat_conjugate(q_wxyz)
-        w = q_inv[..., 0:1]
-        xyz = q_inv[..., 1:4]
-        t = 2.0 * torch.cross(xyz, v, dim=-1)
-        return v + w * t + torch.cross(xyz, t, dim=-1)
+    # Full-width target template: fingers stay at default_joint_pos forever.
+    default_jp_full_t = robot.data.default_joint_pos.clone()
 
     # --- Main loop -------------------------------------------------------
+    num_policy_steps = int(args.episode_sec * POLICY_HZ)
     future_offsets = torch.arange(
         0, G1_NUM_FUTURE_FRAMES * 5, 5, dtype=torch.long, device=device
     )
 
-    t = 0
-    while simulation_app.is_running():
+    print(
+        f"[info] cubes spawned at pelvis-frame rest → "
+        f"right={_RIGHT_CUBE_POS}, left={_LEFT_CUBE_POS}. Move them to redirect hands."
+    )
 
-        joint_pos_il = robot.data.joint_pos.clone()
-        joint_vel_il = robot.data.joint_vel.clone()
-        root_pos_w = (robot.data.root_state_w[:, 0:3] - scene.env_origins).clone()
-        root_quat_w = robot.data.root_state_w[:, 3:7].clone()
+    for t in range(num_policy_steps):
+        if not simulation_app.is_running():
+            break
+
+        # Slice the full 43-joint state to body-29 for the policy.
+        joint_pos_il = robot.data.joint_pos[:, body_idx_t].clone()
+        joint_vel_il = robot.data.joint_vel[:, body_idx_t].clone()
+        root_pos_w = robot.data.root_pos_w.clone()
+        root_quat_w = robot.data.root_quat_w.clone()
         base_ang_vel_b = robot.data.root_ang_vel_b.clone()
         gravity_b = robot.data.projected_gravity_b.clone()
-
-        in_crouch = t < args.crouch_steps
-        phase_mode = kneel_mode_id if in_crouch else PLANNER_MODE_IDLE
-        phase_height = kneel_height if in_crouch else PLANNER_HEIGHT_DEFAULT
-        current_rest_z = rest_z_crouch if in_crouch else rest_z_stand
 
         if t % PLANNER_EVERY_K_POLICY_STEPS == 0:
             if t > 0:
                 planner_context = _context_from_cache(planner_cache, playback_idx)
             feeds = _build_planner_feeds(
                 planner_context.cpu().numpy(),
-                mode=phase_mode,
+                mode=PLANNER_MODE_IDLE,
                 movement_dir=movement_dir,
                 facing_dir=facing_dir,
-                target_vel=0.0,
-                height=phase_height,
+                target_vel=args.target_vel,
+                height=PLANNER_HEIGHT_DEFAULT,
                 num_envs=args.num_envs,
-                random_seed=args.random_seed,
             )
             traj_np, _ = planner_pool.run_batched(feeds)
             traj_t = torch.as_tensor(traj_np, device=device, dtype=torch.float32)
@@ -456,21 +429,6 @@ def main():
         leg_pos_mj = joints_mj_future[..., leg_mj_slots]
         leg_vel_mj = (joints_mj_future_next[..., leg_mj_slots] - leg_pos_mj) * POLICY_HZ
 
-        # --- Auto-update cube Z to track pelvis; user keeps X/Y dragging --
-        # cube_world_z := pelvis_z + rest_z_scaled. Written back each tick so
-        # the cube is always anchored to the pelvis's current height.
-        for i in range(args.num_envs):
-            origin = env_origins_np[i]
-            pelvis_z_w = float(root_pos_w[i, 2].item()) + origin[2]
-            target_z = pelvis_z_w + current_rest_z
-            rp, rq = right_cubes[i].get_world_pose()
-            lp, lq = left_cubes[i].get_world_pose()
-            rp = np.asarray(rp, dtype=np.float32); rp[2] = target_z
-            lp = np.asarray(lp, dtype=np.float32); lp[2] = target_z
-            right_cubes[i].set_world_pose(position=rp, orientation=np.asarray(rq, dtype=np.float32))
-            left_cubes[i].set_world_pose(position=lp, orientation=np.asarray(lq, dtype=np.float32))
-
-        # Read cube world poses (after Z rewrite), transform to pelvis frame.
         right_pos_list, right_quat_list = [], []
         left_pos_list, left_quat_list = [], []
         for i in range(args.num_envs):
@@ -488,11 +446,13 @@ def main():
             np.stack(left_pos_list), device=device
         ) - scene.env_origins
         left_quat_w = torch.as_tensor(np.stack(left_quat_list), device=device)
+        robot_root_pos_local = root_pos_w - scene.env_origins
 
-        right_pos_p = _quat_rotate_inv(root_quat_w, right_pos_w - root_pos_w)
+        right_pos_p = _quat_rotate_inv(root_quat_w, right_pos_w - robot_root_pos_local)
         right_quat_p = quat_mul(quat_conjugate(root_quat_w), right_quat_w)
-        left_pos_p = _quat_rotate_inv(root_quat_w, left_pos_w - root_pos_w)
+        left_pos_p = _quat_rotate_inv(root_quat_w, left_pos_w - robot_root_pos_local)
         left_quat_p = quat_mul(quat_conjugate(root_quat_w), left_quat_w)
+
         right_target_pelvis = torch.cat([right_pos_p, right_quat_p], dim=-1)
         left_target_pelvis = torch.cat([left_pos_p, left_quat_p], dim=-1)
 
@@ -515,7 +475,7 @@ def main():
 
         ref_root_quat_future_wxyz = frames[..., 3:7]
 
-        target_il = infer.step(
+        target_body_il = infer.step(
             joint_pos_future=joint_pos_future,
             joint_vel_future=joint_vel_future,
             ref_root_quat_future_wxyz=ref_root_quat_future_wxyz,
@@ -526,8 +486,12 @@ def main():
             root_quat_wxyz=root_quat_w,
         )
 
+        # Splice body-29 targets into the full 43-joint command; fingers stay at default.
+        target_full = default_jp_full_t.clone()
+        target_full[:, body_idx_t] = target_body_il
+
         for _ in range(DECIMATION):
-            robot.set_joint_position_target(target_il)
+            robot.set_joint_position_target(target_full)
             scene.write_data_to_sim()
             sim.step()
             scene.update(dt=SIM_DT)
@@ -536,14 +500,11 @@ def main():
 
         if t % 50 == 0:
             z = (robot.data.root_pos_w[:, 2] - scene.env_origins[:, 2]).cpu().tolist()
-            ref_z = frames[:, 0, 2].cpu().tolist()
-            phase_name = "crouch" if in_crouch else "stand"
             print(
-                f"[t={t / POLICY_HZ:5.2f}s] phase={phase_name} "
-                f"z={z} planner_ref_z={ref_z}"
+                f"[t={t / POLICY_HZ:5.2f}s] z={z}  "
+                f"right_pelvis={right_pos_p[0].cpu().tolist()}  "
+                f"left_pelvis={left_pos_p[0].cpu().tolist()}"
             )
-
-        t += 1
 
     planner_pool.close()
     simulation_app.close()
