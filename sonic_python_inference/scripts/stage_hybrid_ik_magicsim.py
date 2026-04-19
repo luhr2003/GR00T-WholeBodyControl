@@ -32,6 +32,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import itertools
 import re
 
 import numpy as np
@@ -132,6 +133,9 @@ from sonic_python_inference.g1_pink_ik_cfg import (  # noqa: E402
     LEFT_WRIST_REST_POSE_PELVIS,
     PINK_CONTROLLED_JOINTS_IL,
     RIGHT_WRIST_REST_POSE_PELVIS,
+)
+from sonic_python_inference.joint_order import (  # noqa: E402
+    g1_body_indices_in_training_order,
 )
 
 
@@ -290,13 +294,14 @@ def main():
     print(f"[info] full joint list (len={len(full_joint_names)}): {full_joint_names}")
 
     # Body joints = all non-hand joints. SONIC's policy is 29-DOF.
-    body_idx_full = [i for i, n in enumerate(full_joint_names) if not HAND_RE.fullmatch(n)]
-    body_joint_names = [full_joint_names[i] for i in body_idx_full]
+    body_idx_full, body_joint_names = g1_body_indices_in_training_order(
+        full_joint_names, HAND_RE
+    )
     assert len(body_idx_full) == NUM_JOINTS, (
         f"expected {NUM_JOINTS} body joints, got {len(body_idx_full)}"
     )
     body_idx_t = torch.as_tensor(body_idx_full, dtype=torch.long, device=device)
-    print(f"[info] body joints (IL order, len={NUM_JOINTS}): {body_joint_names}")
+    print(f"[info] body joints (training IL order, len={NUM_JOINTS}): {body_joint_names}")
 
     default_jp_full = robot.data.default_joint_pos[0].cpu().numpy().astype(np.float32)
     default_joint_pos_il = default_jp_full[body_idx_full]
@@ -375,7 +380,6 @@ def main():
     default_jp_full_t = robot.data.default_joint_pos.clone()
 
     # --- Main loop -------------------------------------------------------
-    num_policy_steps = int(args.episode_sec * POLICY_HZ)
     future_offsets = torch.arange(
         0, G1_NUM_FUTURE_FRAMES * 5, 5, dtype=torch.long, device=device
     )
@@ -385,7 +389,7 @@ def main():
         f"right={_RIGHT_CUBE_POS}, left={_LEFT_CUBE_POS}. Move them to redirect hands."
     )
 
-    for t in range(num_policy_steps):
+    for t in itertools.count():
         if not simulation_app.is_running():
             break
 

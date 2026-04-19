@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import itertools
 import math
 import re
 
@@ -322,14 +323,13 @@ def main():
     ).unsqueeze(0).expand(args.num_envs, -1).contiguous()
 
     # --- Main loop --------------------------------------------------------
-    num_policy_steps = int(args.episode_sec * POLICY_HZ)
     mpjpe_accum = torch.zeros(args.num_envs, device=device)
     step_counter = 0
     future_offsets = torch.arange(
         0, G1_NUM_FUTURE_FRAMES * 5, 5, dtype=torch.long, device=device
     )  # [10]
 
-    for t in range(num_policy_steps):
+    for t in itertools.count():
         if not simulation_app.is_running():
             break
 

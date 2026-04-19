@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import itertools
 import re
 
 import numpy as np
@@ -254,13 +255,11 @@ def main():
     scene.update(dt=0.0)
 
     # --- Main loop -----------------------------------------------------
-    num_policy_steps = int(args.episode_sec * POLICY_HZ)
     print(
-        f"[info] hybrid-planner-only: fixed_base, mode=SLOW_WALK, vel={args.target_vel}, "
-        f"ticks={num_policy_steps}"
+        f"[info] hybrid-planner-only: fixed_base, mode=SLOW_WALK, vel={args.target_vel}"
     )
 
-    for t in range(num_policy_steps):
+    for t in itertools.count():
         if not simulation_app.is_running():
             break
 

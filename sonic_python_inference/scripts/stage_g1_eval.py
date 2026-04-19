@@ -226,11 +226,18 @@ def main():
 
         if t % 50 == 0:
             z = robot.data.root_pos_w[:, 2] - scene.env_origins[:, 2]
+            # Per-joint diff for env 0: lower body only (first 12 of IL order,
+            # but ordered LHP,RHP,waist_yaw,LHR,RHR,... so pick explicit hip+knee+ankle)
+            il_names = il_joint_names
+            diff = (robot.data.joint_pos - fut["dof_pos_ref"])[0].cpu().numpy()
+            legs = ["left_hip_pitch_joint","left_hip_roll_joint","left_hip_yaw_joint","left_knee_joint","left_ankle_pitch_joint","left_ankle_roll_joint","right_hip_pitch_joint","right_hip_roll_joint","right_hip_yaw_joint","right_knee_joint","right_ankle_pitch_joint","right_ankle_roll_joint"]
+            leg_str = " ".join(f"{n.replace('_joint','').replace('_','')[:8]}={diff[il_names.index(n)]:+.3f}" for n in legs)
             print(
                 f"[t={t / 50:5.2f}s] z={z.cpu().tolist()}  "
                 f"joint_mae={mpjpe.cpu().tolist()}  "
                 f"fallen={(z < 0.4).cpu().tolist()}"
             )
+            print(f"  lower-body err (rob-ref): {leg_str}")
 
     mean_mpjpe = (mpjpe_accum / max(step_counter, 1)).cpu().tolist()
     final_z = (robot.data.root_pos_w[:, 2] - scene.env_origins[:, 2]).cpu().tolist()

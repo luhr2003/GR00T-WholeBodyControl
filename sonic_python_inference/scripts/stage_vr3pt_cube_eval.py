@@ -304,8 +304,7 @@ def main():
           "move the wrist targets. Torso target stays frozen at the reset pose.")
 
     t = 0
-    num_policy_steps = int(args.episode_sec * 50)
-    while simulation_app.is_running() and t < num_policy_steps:
+    while simulation_app.is_running():
         joint_pos_il = robot.data.joint_pos.clone()
         joint_vel_il = robot.data.joint_vel.clone()
         root_state = robot.data.root_state_w.clone()

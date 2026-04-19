@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import itertools
 import re
 
 import numpy as np
@@ -336,7 +337,6 @@ def main():
     infer.reset(joint_pos=joint_pos_init)
 
     # --- Main loop -------------------------------------------------------
-    num_policy_steps = int(args.episode_sec * POLICY_HZ)
     future_offsets = torch.arange(
         0, G1_NUM_FUTURE_FRAMES * 5, 5, dtype=torch.long, device=device
     )
@@ -346,7 +346,7 @@ def main():
         f"right={_RIGHT_CUBE_POS}, left={_LEFT_CUBE_POS}. Move them to redirect hands."
     )
 
-    for t in range(num_policy_steps):
+    for t in itertools.count():
         if not simulation_app.is_running():
             break
 

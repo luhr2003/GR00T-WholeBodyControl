@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import itertools
 
 
 def _parse_args() -> argparse.Namespace:
@@ -252,13 +253,14 @@ def main():
     )
     playback_idx = torch.zeros(N, device=device, dtype=torch.long)
 
-    num_policy_steps = int(args.episode_sec * 50)
     print(
         f"[info] planner-only probe: mode=WALK, move=[1,0,0], facing=[1,0,0], "
         f"target_vel={target_vel}, spawn_z={args.spawn_height:.2f}"
     )
 
-    for t in range(num_policy_steps):
+    for t in itertools.count():
+        if not simulation_app.is_running():
+            break
         # Replan at 10 Hz using planner's own cache as context feedback
         if t > 0 and t % PLANNER_EVERY == 0:
             new_ctx = _context_from_cache(traj_50hz, playback_idx)

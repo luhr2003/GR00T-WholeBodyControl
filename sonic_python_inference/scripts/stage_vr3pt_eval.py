@@ -282,10 +282,14 @@ def main():
         if t % 50 == 0:
             z = robot.data.root_pos_w[:, 2] - scene.env_origins[:, 2]
             travelled = (root_pos_w[:, 0:2] - start_root_xy).norm(dim=-1)
+            jp = robot.data.joint_pos[0].cpu().numpy()
+            leg_il_idx = [il_joint_names.index(n) for n in ["left_hip_pitch_joint","left_hip_roll_joint","left_hip_yaw_joint","left_knee_joint","right_hip_pitch_joint","right_hip_roll_joint","right_hip_yaw_joint","right_knee_joint"]]
+            leg_vals = " ".join(f"{n.replace('_joint','')[:7]}={jp[i]:+.3f}" for n, i in zip(["LHP","LHR","LHY","LK","RHP","RHR","RHY","RK"], leg_il_idx))
             print(
                 f"[t={t / 50:5.2f}s] travelled={travelled.cpu().tolist()}  "
                 f"z={z.cpu().tolist()}  fallen={(z < 0.4).cpu().tolist()}"
             )
+            print(f"  legs: {leg_vals}")
 
         t += 1
 
