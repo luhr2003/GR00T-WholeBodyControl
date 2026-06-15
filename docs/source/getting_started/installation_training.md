@@ -4,7 +4,7 @@ This guide walks through setting up the SONIC training environment for whole-bod
 
 ## Prerequisites
 
-- **GPU**: NVIDIA GPU with CUDA 12.x (L40, A100, or H100 recommended)
+- **GPU**: NVIDIA GPU with CUDA 12.x (L40 recommended)
 - **OS**: Ubuntu 22.04+
 - **Python**: 3.11 (required by Isaac Lab; sim/teleop/deploy scripts work on 3.10+)
 - **Isaac Lab**: 2.3+ (required for simulation environments)
@@ -49,13 +49,13 @@ This downloads:
 
 ## Prepare Robot Motion Data
 
-SONIC trains on the [Bones-SEED](https://bones-studio.ai/seed) motion capture dataset
+SONIC trains on the [Bones-SEED](https://huggingface.co/datasets/bones-studio/seed) motion capture dataset
 (142K+ motion sequences retargeted to the Unitree G1).
 
 ### Step 1: Download and convert
 
 Download the **G1 retargeted CSVs** (29 DOF, 120 FPS) from
-[bones-studio.ai/seed](https://bones-studio.ai/seed), then convert:
+[Bones-SEED on HuggingFace](https://huggingface.co/datasets/bones-studio/seed), then convert:
 
 ```bash
 python gear_sonic/data_process/convert_soma_csv_to_motion_lib.py \
