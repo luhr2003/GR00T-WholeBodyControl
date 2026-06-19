@@ -12,6 +12,11 @@ dependencies = [
     "numpy>=1.26,<2",
     "torch==2.7.0",
     "torchvision==0.22.0",
+    # torchaudio must match torch's CUDA build (cu128). transformers (pulled by
+    # trl) hard-imports torchaudio in loss_rnnt at import time, and torchaudio
+    # aborts if its CUDA version != torch's. Pin + route through the cu128 index
+    # (source in the root pyproject) to keep all three torch wheels aligned.
+    "torchaudio==2.7.0",
 
     # ONNX runtime + export helpers
     "onnx",

@@ -55,6 +55,7 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
 isaaclab = { index = "nvidia" }
 isaacsim = { index = "nvidia" }
 sonic_python_inference = { workspace = true }
