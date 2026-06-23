@@ -6,6 +6,7 @@ Repository: https://huggingface.co/nvidia/GEAR-SONIC
 
 Usage:
     python download_from_hf.py                    # ONNX models for deployment
+    python download_from_hf.py --low-latency      # Low-latency ONNX models
     python download_from_hf.py --training          # PyTorch checkpoint + SMPL data
     python download_from_hf.py --sample            # Sample data only (quick start)
     python download_from_hf.py --output-dir /path  # custom output directory
@@ -28,11 +29,23 @@ POLICY_FILES = [
     ("observation_config.yaml", "policy/release/observation_config.yaml"),
 ]
 
+LOW_LATENCY_POLICY_FILES = [
+    ("low_latency/model_encoder.onnx", "policy/low_latency/model_encoder.onnx"),
+    ("low_latency/model_decoder.onnx", "policy/low_latency/model_decoder.onnx"),
+    ("low_latency/observation_config.yaml", "policy/low_latency/observation_config.yaml"),
+]
+
 PLANNER_FILE = ("planner_sonic.onnx", "planner/target_vel/V2/planner_sonic.onnx")
 
 TRAINING_FILES = [
     ("sonic_release/last.pt", "sonic_release/last.pt"),
     ("sonic_release/config.yaml", "sonic_release/config.yaml"),
+]
+
+LOW_LATENCY_TRAINING_FILES = [
+    ("low_latency/last.pt", "low_latency/last.pt"),
+    ("low_latency/config.yaml", "low_latency/config.yaml"),
+    ("low_latency/model_config.yaml", "low_latency/model_config.yaml"),
 ]
 
 SMPL_TAR_PARTS_PREFIX = "bones_seed_smpl/bones_seed_smpl.tar.part_"
@@ -61,6 +74,15 @@ def parse_args():
         "--training",
         action="store_true",
         help="Download training checkpoint + SMPL motion data (~30 GB)",
+    )
+    parser.add_argument(
+        "--low-latency",
+        action="store_true",
+        help=(
+            "Download the low-latency SONIC variant. For deployment, files are "
+            "placed under gear_sonic_deploy/policy/low_latency/. With --training, "
+            "downloads low_latency/last.pt and its configs."
+        ),
     )
     parser.add_argument(
         "--sample",
@@ -170,6 +192,10 @@ def download_sample_data(snapshot_download, repo_id, output_dir, token=None):
 
 def main():
     args = parse_args()
+    if args.sample and args.low_latency:
+        print("ERROR: --low-latency cannot be combined with --sample", file=sys.stderr)
+        sys.exit(2)
+
     hf_hub_download, snapshot_download = _ensure_huggingface_hub()
 
     repo_root = Path(__file__).resolve().parent
@@ -184,9 +210,14 @@ def main():
     print(f"  Repository : {REPO_ID}")
     print(f"  Output dir : {output_dir}")
     if args.training:
-        print(f"  Mode       : training (checkpoint + SMPL data)")
+        if args.low_latency:
+            print(f"  Mode       : low-latency training checkpoint")
+        else:
+            print(f"  Mode       : training (checkpoint + SMPL data)")
     elif args.sample:
         print(f"  Mode       : sample data (quick start)")
+    elif args.low_latency:
+        print(f"  Mode       : low-latency deployment (ONNX models)")
     else:
         print(f"  Mode       : deployment (ONNX models)")
     print("=" * 60)
@@ -197,13 +228,16 @@ def main():
 
     elif args.training:
         print("\n[Checkpoint]")
-        for hf_filename, local_rel in TRAINING_FILES:
+        training_files = LOW_LATENCY_TRAINING_FILES if args.low_latency else TRAINING_FILES
+        for hf_filename, local_rel in training_files:
             download_file(
                 hf_hub_download, REPO_ID, hf_filename,
                 output_dir / local_rel, token=args.token,
             )
 
-        if not args.no_smpl:
+        if args.low_latency:
+            print("\n[SMPL Motion Data] Skipped (not part of low-latency checkpoint download)")
+        elif not args.no_smpl:
             print("\n[SMPL Motion Data]")
             download_and_extract_smpl(hf_hub_download, REPO_ID, output_dir, token=args.token)
         else:
@@ -211,7 +245,8 @@ def main():
 
     else:
         print("\n[Policy]")
-        for hf_filename, local_rel in POLICY_FILES:
+        policy_files = LOW_LATENCY_POLICY_FILES if args.low_latency else POLICY_FILES
+        for hf_filename, local_rel in policy_files:
             download_file(
                 hf_hub_download, REPO_ID, hf_filename,
                 output_dir / local_rel, token=args.token,
