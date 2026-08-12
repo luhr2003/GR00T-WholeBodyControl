@@ -74,6 +74,38 @@ See [Data Collection](data_collection.md) for camera server setup.
 
 The `gear_sonic_deploy` binary must be built. See the main README.
 
+### SONIC v1.1 Checkpoint
+
+Use the `sonic_v1_1/` checkpoint when the VLA policy was trained against
+the robot-heading-normalized SONIC controller. It uses a 10-frame SMPL/wrist
+reference horizon and was trained with wrist-pose augmentation. It is not the
+low-latency checkpoint.
+
+```bash
+python download_from_hf.py --sonic-v1-1
+```
+
+Launch the matching C++ controller:
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/sonic_v1_1/model \
+    --obs-config policy/sonic_v1_1/observation_config.yaml \
+    --input-type zmq_manager \
+    real
+```
+
+Or pass the same model pair to the Python launcher:
+
+```bash
+python gear_sonic/scripts/launch_inference.py \
+    --deploy-checkpoint policy/sonic_v1_1/model \
+    --deploy-obs-config policy/sonic_v1_1/observation_config.yaml \
+    --camera-host 192.168.123.164 \
+    --prompt "pick up the cup"
+```
+
 ### Low-Latency Teleoperation Checkpoint
 
 The `low_latency/` checkpoint is configured for responsive whole-body

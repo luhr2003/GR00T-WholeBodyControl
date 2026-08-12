@@ -31,6 +31,7 @@ This is the codebase for the **GR00T Whole-Body Control (WBC)** projects. It hos
 
 ## News
 
+- **[2026-07-23]** **SONIC v1.1 checkpoint** — released a robot-heading-normalized SONIC controller trained with wrist-pose augmentation for 3-point teleoperation and SONIC-backed VLA execution. See the [Model Card](#model-card) and [Download Models](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/download_models.html#sonic-v11-checkpoint).
 - **[06/16]** **Isaac Teleop Setup (CloudXR / DeviceIO, in-process)** — added bring-up docs for the in-process CloudXR path via `isaacteleop[cloudxr]`, with no separate publisher container. See [Isaac Teleop Setup](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/isaac_teleop_publisher_setup.html).
 - **[2026-06-16]** **Low-latency teleoperation checkpoint** — released a SONIC checkpoint with 4-frame SMPL reference lookahead for more responsive whole-body teleoperation. See the [Model Card](#model-card), [Download Models](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/download_models.html#low-latency-teleoperation-checkpoint), and [VLA Inference](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/vla_inference.html#low-latency-teleoperation-checkpoint).
 - **[2026-05-07]** 🤖 **End-to-end VLA workflow on G1** — collect teleop data, fine-tune Isaac-GR00T N1.7, and deploy with SONIC whole-body control. See [Data Collection](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/data_collection.html), [VLA Workflow](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/vla_workflow.html), and [VLA Inference](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/vla_inference.html).
@@ -81,7 +82,7 @@ In this repo, we release SONIC's training code, deployment framework, model chec
 
 ## Model Card
 
-SONIC provides two released Unitree G1 checkpoints. Choose the model based on whether you want the original general-purpose controller or reduced reference lookahead for teleoperation.
+SONIC provides three released Unitree G1 checkpoints. Choose the model based on its reference representation and intended deployment.
 
 ### Available Models
 
@@ -89,8 +90,9 @@ SONIC provides two released Unitree G1 checkpoints. Choose the model based on wh
 |---|---|---|---|
 | **Default SONIC (original release)** | Top-level `model_encoder.onnx`, `model_decoder.onnx`, and `observation_config.yaml`; training checkpoint at `sonic_release/last.pt` | 10 future frames at 20 ms spacing, approximately 200 ms of reference lookahead | Default general-purpose SONIC controller for motion tracking, planning, teleoperation, and compatibility with existing deployments. G1 and teleoperation future-reference observations use `step5`. |
 | **Low-latency teleoperation** | [`low_latency/`](https://huggingface.co/nvidia/GEAR-SONIC/tree/main/low_latency) | 4 future frames at 20 ms spacing, approximately 80 ms of reference lookahead | Intended for more responsive whole-body teleoperation and VLA execution. G1 and teleoperation future-reference observations use `step1`. Use its encoder, decoder, and observation config together. |
+| **SONIC v1.1** | [`sonic_v1_1/`](https://huggingface.co/nvidia/GEAR-SONIC/tree/main/sonic_v1_1) | 10 future frames at 20 ms spacing, approximately 200 ms of reference lookahead | Uses robot-heading-normalized target orientation and was trained with wrist-pose augmentation. Intended for heading-stable 3-point teleoperation and SONIC-backed VLA policies that use this controller. G1 and teleoperation future-reference observations use `step5`; this is not the low-latency model. |
 
-Both models use the SONIC universal-token controller, produce 64-dimensional latent motion tokens, run the controller at 50 Hz, and support SMPL pose, G1 motion reference, and VR 3-point inputs. Deployment uses C++ and TensorRT; the PyTorch checkpoints support Isaac Lab evaluation and continued training.
+All three models use the SONIC universal-token controller, produce 64-dimensional latent motion tokens, run the controller at 50 Hz, and support SMPL pose, G1 motion reference, and VR 3-point inputs. Deployment uses C++ and TensorRT; the PyTorch checkpoints support Isaac Lab evaluation and continued training.
 
 The lookahead values describe the reference horizon presented to the controller. They are **not** measurements of total end-to-end teleoperation latency, which also includes sensing, networking, preprocessing, and inference. Model weights are covered by the [NVIDIA Open Model License](LICENSE).
 
@@ -100,6 +102,7 @@ The lookahead values describe the reference horizon presented to the controller.
 |---|---|---|
 | Default SONIC | `model_encoder.onnx`, `model_decoder.onnx`, `observation_config.yaml` | `sonic_release/last.pt`, `sonic_release/config.yaml` |
 | Low-latency teleoperation | `low_latency/model_encoder.onnx`, `low_latency/model_decoder.onnx`, `low_latency/observation_config.yaml` | `low_latency/last.pt`, `low_latency/config.yaml`, `low_latency/model_config.yaml` |
+| SONIC v1.1 | `sonic_v1_1/model_encoder.onnx`, `sonic_v1_1/model_decoder.onnx`, `sonic_v1_1/observation_config.yaml` | `sonic_v1_1/last.pt`, `sonic_v1_1/config.yaml`, `sonic_v1_1/model_config.yaml` |
 
 ### Usage
 
@@ -113,6 +116,12 @@ Download the low-latency teleoperation model and planner:
 
 ```bash
 python download_from_hf.py --low-latency
+```
+
+Download SONIC v1.1 and the planner:
+
+```bash
+python download_from_hf.py --sonic-v1-1
 ```
 
 Run the default C++ deployment stack:
@@ -129,6 +138,17 @@ cd gear_sonic_deploy
 ./deploy.sh \
     --cp policy/low_latency/model \
     --obs-config policy/low_latency/observation_config.yaml \
+    --input-type zmq_manager \
+    real
+```
+
+Run the SONIC v1.1 C++ deployment stack:
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/sonic_v1_1/model \
+    --obs-config policy/sonic_v1_1/observation_config.yaml \
     --input-type zmq_manager \
     real
 ```
@@ -151,7 +171,10 @@ python gear_sonic/scripts/launch_inference.py \
     --prompt "pick up the cup"
 ```
 
-See [Downloading Model Checkpoints](docs/source/getting_started/download_models.md#low-latency-teleoperation-checkpoint) for Python checkpoint evaluation and additional deployment options. Test in simulation before using the checkpoint on a physical robot.
+For SONIC v1.1, use `policy/sonic_v1_1/model` and its matching
+`policy/sonic_v1_1/observation_config.yaml` in the same launcher flags.
+
+See [Downloading Model Checkpoints](docs/source/getting_started/download_models.md#sonic-v11-checkpoint) for Python checkpoint evaluation and additional deployment options. Test in simulation before using the checkpoint on a physical robot.
 
 
 ## VR Whole-Body Teleoperation
